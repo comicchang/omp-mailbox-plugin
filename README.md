@@ -3,10 +3,12 @@
 OMP extension for Syncthing-native direct-inbox worker-to-worker messaging.
 No relay daemon, no Manager intervention — workers communicate directly through a shared filesystem.
 
+**Detection**: `Bun.watch` (zero-latency inotify) + `ctx.setInterval` (60s fallback).
+
 ```
 Worker A:  mailbox send → $MAILBOX_ROOT/{to}/inbox/{from}_{ts}.json
-                              ↓ Syncthing
-Worker B:  OMP agent_end → poll inbox → inject context → process
+                              ↓ Syncthing sync + atomic rename
+Worker B:  Bun.watch("rename") → poll → sendMessage(triggerTurn) → process
 ```
 
 ## Installation
@@ -27,14 +29,15 @@ Worker B:  OMP agent_end → poll inbox → inject context → process
 mailbox send --from ios-re --to ios-shader --subject "Glass done" --body "..."
 ```
 
-**Receive** (automatic — no agent action):
+**Receive** (automatic):
 ```
 agent_end → check inbox → 1 pending → sendMessage(triggerTurn:true) → agent processes
 ```
 
-**Idle polling** (catches late-arriving messages):
+**Idle detection** (dual mechanism):
 ```
-ctx.setInterval → every 30s → check inbox → wake if pending
+Bun.watch(inboxDir)  → rename event → immediate poll  (primary, zero latency)
+ctx.setInterval(60s) → periodic poll                  (fallback, Syncthing edge cases)
 ```
 
 **Status update:**
@@ -42,15 +45,15 @@ ctx.setInterval → every 30s → check inbox → wake if pending
 mailbox status --worker ios-shader --state BUSY --current-task "glass shader"
 ```
 
-## Directory Layout
+**Clear archive + prune corrupt:**
+```
+mailbox clear --worker ios-shader --prune-corrupt --older-than-days 30
+```
+
+## Development
 
 ```
-$MAILBOX_ROOT/
-  {worker_id}/
-    inbox/        ← Others write here (Syncthing)
-    archive/      ← Read messages (cleared at task end)
-    _corrupt/     ← Unparseable messages
-    status.json   ← Self-reported state
+bun test
 ```
 
 ## Protocol
