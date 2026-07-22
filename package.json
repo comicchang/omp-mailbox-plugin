@@ -1,0 +1,17 @@
+{
+  "name": "omp-mailbox-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "files": ["src"],
+  "omp": { "extensions": ["./src/index.ts"] },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^17.0.7",
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
+  },
+  "description": "Syncthing direct-inbox mailbox notifications for OMP workers"
+}
