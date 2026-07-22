@@ -4,8 +4,5 @@
   "type": "module",
   "files": ["src"],
   "omp": { "extensions": ["./src/index.ts"] },
-  "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": ">=17.0"
-  },
   "description": "Syncthing direct-inbox mailbox notifications for OMP workers"
 }
