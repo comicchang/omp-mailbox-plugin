@@ -105,8 +105,17 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
   const cfg = getConfig();
   if (cfg) { activate(pi, ctx, cfg); return; }
 
-  // Deferred: Worker agent sets OMP_SESSION_ID + OMP_WORKER_ID via INIT protocol.
-  // The first agent_end after INIT fires will trigger activation.
+  // Slash command: agent sets its mailbox identity during INIT
+  // Usage: /set_mailbox_username <session_id> <worker_id>
+  (pi as Record<string, unknown>).registerCommand?.("/set_mailbox_username", (args: string) => {
+    const parts = args.trim().split(/\s+/);
+    if (parts.length < 2) return "Usage: /set_mailbox_username <session_id> <worker_id>";
+    process.env.OMP_SESSION_ID = parts[0];
+    process.env.OMP_WORKER_ID = parts[1];
+    return `Mailbox identity set: session=${parts[0]}, worker=${parts[1]}. Plugin will activate on next agent_end.`;
+  });
+
+  // Deferred activation: first agent_end after identity is set
   let activated = false;
   pi.on("agent_end", () => {
     if (activated) return;
