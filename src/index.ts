@@ -37,7 +37,6 @@ function identityPath(agentId = "default"): string {
   return `${dir}/mailbox-identity.json`;
 }
 
-/** Agent writes during INIT: echo '{"session_id":"s","worker_id":"w"}' > ~/.omp/<agent>/mailbox-identity.json */
 function getConfigFromFile(): Config | null {
   const candidates = [process.env.OMP_WORKER_ID, "default"].filter(Boolean) as string[];
   for (const agent of candidates) {
@@ -81,6 +80,7 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
+  const intervalId: ReturnType<typeof setInterval> | null = null;
 
   async function poll(): Promise<void> {
     if (polling) return;
@@ -103,14 +103,19 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
   }
 
   watcherAc = setupWatcher(cfg.inboxDir, poll);
-  ctx.setInterval(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
+
+  // Fallback periodic poll (30s) — uses global setInterval if ctx.setInterval unavailable
+  const timerFn = (ctx.setInterval ?? ((cb: () => void, ms: number) => setInterval(cb, ms))) as (cb: () => void, ms: number) => unknown;
+  const interval = timerFn(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
+
   pi.on("agent_end", poll);
   pi.on("session_shutdown", () => {
     if (watcherAc) watcherAc.abort();
+    clearInterval(interval as ReturnType<typeof setInterval>);
     try { unlinkSync(identityPath(cfg.agentId)); } catch { /* ok */ }
   });
 
-  poll(); // immediately check existing inbox
+  poll(); // immediate check for existing inbox messages
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
