@@ -2,7 +2,7 @@
   "name": "omp-mailbox-plugin",
   "version": "0.1.0",
   "type": "module",
-  "files": ["src"],
+  "files": ["src", "bin"],
   "omp": { "extensions": ["./src/index.ts"] },
   "description": "Syncthing direct-inbox mailbox notifications for OMP workers"
 }
