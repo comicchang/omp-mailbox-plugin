@@ -101,11 +101,8 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
   // Identity file path injected by launcher at startup (OS-level env inherit)
   const identityPath = process.env.OMP_MAILBOX_IDENTITY_FILE;
   if (!identityPath) {
-    console.error("[mailbox] OMP_MAILBOX_IDENTITY_FILE not set — plugin disabled");
-    return;
+    return;  // Manager session — no mailbox monitoring needed
   }
-
-  console.error(`[mailbox] watching: ${identityPath}`);
 
   // Poll for agent-written identity JSON every2s; activate when found
   const idInterval = setInterval(() => {
