@@ -78,7 +78,7 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identity
         (pi as Record<string, unknown>).sendMessage?.(
           { customType: "omp-mailbox", display: true,
             content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> notification — run mailbox read to consume`,
-            attribution: { name: `mailbox:${msg.from}`, icon: "📬" } },
+            details: { from: msg.from, kind: msg.kind } },
           { triggerTurn: true, deliverAs: "nextTurn" },
         );
       }
