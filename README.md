@@ -22,7 +22,7 @@ Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(trigger
 |---|---|---|
 | `OMP_SESSION_ID` | Yes | Session identifier (same across session agents) |
 | `OMP_WORKER_ID` | Yes | Agent ID matching inbox directory |
-| `MAILBOX_ROOT` | No | Path to `_mailbox` root |
+| `MAILBOX_ROOT` | No | Path to `.mailbox` root |
 | `MAILBOX_CLI` | No | Path to `mailbox` CLI (default: bundled `bin/mailbox` alongside plugin) |
 
 ## How it works

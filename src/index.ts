@@ -21,7 +21,7 @@ function getConfig(): Config | null {
   const sessionId = process.env.OMP_SESSION_ID;
   const agentId = process.env.OMP_WORKER_ID;
   if (!sessionId || !agentId) return null;
-  const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/_mailbox`;
+  const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/.mailbox`;
   const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
