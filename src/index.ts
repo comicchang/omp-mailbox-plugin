@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { readFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 
 const POLL_MS = 30_000;
+const IDENTITY_POLL_MS = 2_000;
 const CHECK_TIMEOUT_MS = 5_000;
 const MAX_DEDUP_IDS = 100;
 
@@ -25,33 +27,23 @@ function buildConfig(sessionId: string, agentId: string): Config {
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
 
-function getConfig(): Config | null {
-  const sid = process.env.OMP_SESSION_ID;
-  const wid = process.env.OMP_WORKER_ID;
-  return sid && wid ? buildConfig(sid, wid) : null;
+function generateIdentityPath(): string {
+  const dir = `${homedir()}/.omp/mailbox-identity`;
+  mkdirSync(dir, { recursive: true });
+  const nonce = randomBytes(4).toString("hex");
+  return `${dir}/${process.pid}-${nonce}.json`;
 }
 
-function identityPath(agentId = "default"): string {
-  const dir = `${homedir()}/.omp/${agentId}`;
-  try { mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
-  return `${dir}/mailbox-identity.json`;
-}
-
-function getConfigFromFile(): Config | null {
-  const candidates = [process.env.OMP_WORKER_ID, "default"].filter(Boolean) as string[];
-  for (const agent of candidates) {
-    const path = identityPath(agent);
-    try {
-      if (!existsSync(path)) continue;
-      const data = JSON.parse(readFileSync(path, "utf-8"));
-      const sid = data.session_id || data.sessionId;
-      const wid = data.worker_id || data.agentId || data.workerId;
-      if (!sid || !wid) continue;
-      console.error(`[mailbox] identity loaded: ${sid}/${wid} from ${path}`);
-      return buildConfig(sid, wid);
-    } catch { /* try next */ }
-  }
-  return null;
+function readIdentityFile(path: string): Config | null {
+  try {
+    if (!existsSync(path)) return null;
+    const data = JSON.parse(readFileSync(path, "utf-8"));
+    const sid = data.session_id || data.sessionId;
+    const wid = data.worker_id || data.agentId || data.workerId;
+    if (!sid || !wid) return null;
+    console.error(`[mailbox] identity loaded: ${sid}/${wid} from ${path}`);
+    return buildConfig(sid, wid);
+  } catch { return null; }
 }
 
 async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
@@ -76,11 +68,10 @@ function setupWatcher(inboxDir: string, poll: () => void): AbortController | nul
   } catch { console.error("[mailbox] watch setup failed:", inboxDir); return null; }
 }
 
-function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
+function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): void {
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
-  const intervalId: ReturnType<typeof setInterval> | null = null;
 
   async function poll(): Promise<void> {
     if (polling) return;
@@ -103,31 +94,38 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
   }
 
   watcherAc = setupWatcher(cfg.inboxDir, poll);
-
-  // Fallback periodic poll (30s) — uses global setInterval if ctx.setInterval unavailable
-  const timerFn = (ctx.setInterval ?? ((cb: () => void, ms: number) => setInterval(cb, ms))) as (cb: () => void, ms: number) => unknown;
-  const interval = timerFn(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
-
+  const interval = setInterval(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
   pi.on("agent_end", poll);
   pi.on("session_shutdown", () => {
     if (watcherAc) watcherAc.abort();
-    clearInterval(interval as ReturnType<typeof setInterval>);
-    try { unlinkSync(identityPath(cfg.agentId)); } catch { /* ok */ }
+    clearInterval(interval);
+    try { unlinkSync(identityPath); } catch { /* ok */ }
   });
 
-  poll(); // immediate check for existing inbox messages
+  poll();
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-  const cfg = getConfig();
-  if (cfg) { activate(pi, ctx, cfg); return; }
+  // Fast path: env vars pre-set (launcher scenario)
+  const sid = process.env.OMP_SESSION_ID;
+  const wid = process.env.OMP_WORKER_ID;
+  if (sid && wid) { activate(pi, ctx, buildConfig(sid, wid), generateIdentityPath()); return; }
 
-  let activated = false;
-  pi.on("agent_end", () => {
-    if (activated) return;
-    const cfg = getConfigFromFile() ?? getConfig();
+  // Per-process identity file: each OMP instance gets a unique path
+  const identityPath = generateIdentityPath();
+  process.env.OMP_MAILBOX_IDENTITY_FILE = identityPath;
+  console.error(`[mailbox] identity file: ${identityPath}`);
+
+  // Poll for identity file every2s; activate when found
+  const idInterval = setInterval(() => {
+    const cfg = readIdentityFile(identityPath);
     if (!cfg) return;
-    activated = true;
-    activate(pi, ctx, cfg);
+    clearInterval(idInterval);
+    activate(pi, ctx, cfg, identityPath);
+  }, IDENTITY_POLL_MS);
+
+  pi.on("session_shutdown", () => {
+    clearInterval(idInterval);
+    try { unlinkSync(identityPath); } catch { /* ok */ }
   });
 }
