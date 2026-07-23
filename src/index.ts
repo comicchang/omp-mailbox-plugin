@@ -16,9 +16,9 @@ interface Config {
   inboxDir: string;
 }
 
-function getConfig(): Config {
+function getConfig(): Config | null {
   const workerId = process.env.OMP_WORKER_ID;
-  if (!workerId) throw new Error("OMP_WORKER_ID is not set");
+  if (!workerId) return null;
   const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/_mailbox`;
   const cli = process.env.MAILBOX_CLI ?? `${root}/tools/mailbox`;
   return { workerId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${workerId}/inbox` };
@@ -35,9 +35,9 @@ async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
   const cfg = getConfig();
+  if (!cfg) return;  // not a Worker session — silently skip
   let polling = false;
   const seen = new Set<string>();
-
   async function poll(): Promise<void> {
     if (polling) return;
     polling = true;
