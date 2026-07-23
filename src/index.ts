@@ -1,7 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { readFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
 
 const POLL_MS = 30_000;
 const IDENTITY_POLL_MS = 2_000;
@@ -27,21 +26,14 @@ function buildConfig(sessionId: string, agentId: string): Config {
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
 
-function generateIdentityPath(): string {
-  const dir = `${homedir()}/.omp/mailbox-identity`;
-  mkdirSync(dir, { recursive: true });
-  const nonce = randomBytes(4).toString("hex");
-  return `${dir}/${process.pid}-${nonce}.json`;
-}
-
 function readIdentityFile(path: string): Config | null {
   try {
     if (!existsSync(path)) return null;
     const data = JSON.parse(readFileSync(path, "utf-8"));
-    const sid = data.session_id || data.sessionId;
-    const wid = data.worker_id || data.agentId || data.workerId;
+    const sid = data.session_id ?? data.sessionId;
+    const wid = data.worker_id ?? data.agentId ?? data.workerId;
     if (!sid || !wid) return null;
-    console.error(`[mailbox] identity loaded: ${sid}/${wid} from ${path}`);
+    console.error(`[mailbox] identity: ${sid}/${wid}`);
     return buildConfig(sid, wid);
   } catch { return null; }
 }
@@ -106,17 +98,16 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identity
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-  // Fast path: env vars pre-set (launcher scenario)
-  const sid = process.env.OMP_SESSION_ID;
-  const wid = process.env.OMP_WORKER_ID;
-  if (sid && wid) { activate(pi, ctx, buildConfig(sid, wid), generateIdentityPath()); return; }
+  // Identity file path injected by launcher at startup (OS-level env inherit)
+  const identityPath = process.env.OMP_MAILBOX_IDENTITY_FILE;
+  if (!identityPath) {
+    console.error("[mailbox] OMP_MAILBOX_IDENTITY_FILE not set — plugin disabled");
+    return;
+  }
 
-  // Per-process identity file: each OMP instance gets a unique path
-  const identityPath = generateIdentityPath();
-  process.env.OMP_MAILBOX_IDENTITY_FILE = identityPath;
-  console.error(`[mailbox] identity file: ${identityPath}`);
+  console.error(`[mailbox] watching: ${identityPath}`);
 
-  // Poll for identity file every2s; activate when found
+  // Poll for agent-written identity JSON every2s; activate when found
   const idInterval = setInterval(() => {
     const cfg = readIdentityFile(identityPath);
     if (!cfg) return;
