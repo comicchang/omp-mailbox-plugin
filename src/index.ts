@@ -33,7 +33,7 @@ function readIdentityFile(path: string): Config | null {
     const sid = data.session_id ?? data.sessionId;
     const wid = data.worker_id ?? data.agentId ?? data.workerId;
     if (!sid || !wid) return null;
-    console.error(`[mailbox] identity: ${sid}/${wid}`);
+    console.warn(`[mailbox] identity: ${sid}/${wid}`);
     return buildConfig(sid, wid);
   } catch { return null; }
 }
