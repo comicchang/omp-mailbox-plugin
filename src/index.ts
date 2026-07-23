@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const POLL_MS = 30_000;
 const CHECK_TIMEOUT_MS = 5_000;
-const MAX_DEDUP_IDS = 100; // rolling dedup window
+const MAX_DEDUP_IDS = 100;
 
 interface MailboxSummary {
   pending: number;
@@ -33,11 +33,11 @@ async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
   try { return JSON.parse(out) as MailboxSummary; } catch { return null; }
 }
 
-export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-  const cfg = getConfig();
-  if (!cfg) return;  // not a Worker session — silently skip
+/** Activate mailbox watcher. Called once OMP_WORKER_ID is available. */
+function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
   let polling = false;
   const seen = new Set<string>();
+
   async function poll(): Promise<void> {
     if (polling) return;
     polling = true;
@@ -49,7 +49,6 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
         if (seen.has(msg.msg_id)) continue;
         seen.add(msg.msg_id);
         if (seen.size > MAX_DEDUP_IDS) {
-          // evict oldest — simple first-inserted-first-out
           seen.delete(seen.values().next().value!);
         }
 
@@ -66,26 +65,42 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
     } catch (e) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
 
-  // Primary: inotify via Bun.watch (zero-latency)
+  // Inotify via Bun.watch (zero-latency)
   const ac = new AbortController();
   try {
     const watcher = Bun.watch(cfg.inboxDir, { signal: ac.signal, recursive: false });
     (async () => {
       for await (const event of watcher) {
-        // handle both rename (atomic publish) and create (fallback for some filesystems)
         if (event === "rename" || event === "create") poll();
       }
     })().catch((e) => { console.error("[mailbox] watcher error:", e); });
   } catch (e) { console.error("[mailbox] watch setup failed:", e); }
 
-  // Fallback: periodic poll (catches Syncthing edge cases + watch failures)
+  // Fallback periodic poll
   ctx.setInterval(poll, POLL_MS);
 
-  // Immediate check after each agent turn
+  // Check after each agent turn
   pi.on("agent_end", poll);
 
   // Cleanup on session end
   pi.on("session_shutdown", () => {
     ac.abort();
+  });
+}
+
+export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
+  // Fast path: Worker already initialized, OMP_WORKER_ID set
+  const cfg = getConfig();
+  if (cfg) { activate(pi, ctx, cfg); return; }
+
+  // Deferred path: Worker agent will set OMP_WORKER_ID via INIT protocol.
+  // The first agent_end after INIT fires will trigger activation.
+  let activated = false;
+  pi.on("agent_end", () => {
+    if (activated) return;
+    const cfg = getConfig();
+    if (!cfg) return;
+    activated = true;
+    activate(pi, ctx, cfg);
   });
 }
