@@ -9,7 +9,7 @@ No relay daemon — workers communicate through a shared Syncthing filesystem.
 ```
 Worker A:  mailbox send --session <id> --from A --to B → <session>/B/inbox/{msg_id}.json
                               ↓ Syncthing sync + atomic rename
-Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(triggerTurn) → claim → finalize
+Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(triggerTurn) → read → finalize (auto-claim)
 ```
 
 ## Installation
