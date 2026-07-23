@@ -1,14 +1,15 @@
 # omp-mailbox-plugin
 
-OMP extension for Syncthing-native direct-inbox worker-to-worker messaging.
-No relay daemon, no Manager intervention — workers communicate directly through a shared filesystem.
+OMP extension for session-based direct-inbox worker-to-worker messaging.
+No relay daemon — workers communicate through a shared Syncthing filesystem.
 
-**Detection**: `Bun.watch` (zero-latency inotify, rename+create) + `ctx.setInterval` (30s fallback).
+**Detection**: `Bun.watch` (zero-latency, rename+create) + `ctx.setInterval` (30s fallback) + `agent_end` immediate check.
+**Activation**: deferred — waits for Worker agent to set `OMP_SESSION_ID` + `OMP_WORKER_ID` via INIT protocol.
 
 ```
-Worker A:  mailbox send → $MAILBOX_ROOT/{to}/inbox/{msg_id}.json
+Worker A:  mailbox send --session <id> --from A --to B → <session>/B/inbox/{msg_id}.json
                               ↓ Syncthing sync + atomic rename
-Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(triggerTurn) → process
+Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(triggerTurn) → claim → finalize
 ```
 
 ## Installation
@@ -19,9 +20,10 @@ Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(trigger
 
 | Env | Required | Description |
 |---|---|---|
-| `OMP_WORKER_ID` | Yes | Worker ID matching inbox directory |
-| `MAILBOX_ROOT` | No | Path to shared mailbox root |
-| `MAILBOX_CLI` | No | Path to `mailbox` CLI (default: `$MAILBOX_ROOT/tools/mailbox`) |
+| `OMP_SESSION_ID` | Yes | Session identifier (same across session agents) |
+| `OMP_WORKER_ID` | Yes | Agent ID matching inbox directory |
+| `MAILBOX_ROOT` | No | Path to `_mailbox` root |
+| `MAILBOX_CLI` | No | Path to `mailbox` CLI (default: `$MAILBOX_ROOT/tools/mailbox`)
 
 ## How it works
 
