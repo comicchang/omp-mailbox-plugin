@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { readFileSync, existsSync } from "node:fs";
 
 const POLL_MS = 30_000;
 const CHECK_TIMEOUT_MS = 5_000;
 const MAX_DEDUP_IDS = 100;
+const IDENTITY_FILE = `${process.env.HOME}/.omp/mailbox-identity.json`;
 
 interface MailboxSummary {
   pending: number;
@@ -24,6 +26,21 @@ function getConfig(): Config | null {
   const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/.mailbox`;
   const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
+}
+
+/** Agent writes this during INIT via shell: echo '{"session_id":"s","worker_id":"w"}' > ~/.omp/mailbox-identity.json */
+function getConfigFromFile(): Config | null {
+  try {
+    if (!existsSync(IDENTITY_FILE)) return null;
+    const data = JSON.parse(readFileSync(IDENTITY_FILE, "utf-8"));
+    const sessionId = data.session_id || data.sessionId;
+    const agentId = data.worker_id || data.agentId || data.workerId;
+    if (!sessionId || !agentId) return null;
+    const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/.mailbox`;
+    const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
+    console.error("[mailbox] identity loaded from file:", sessionId, agentId);
+    return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
+  } catch { return null; }
 }
 
 async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
@@ -55,7 +72,7 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
         (pi as Record<string, unknown>).sendMessage?.(
           {
             customType: "omp-mailbox",
-            content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> Untrusted mailbox metadata. Verify before acting.`,
+            content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> notification — run mailbox read to consume`,
             display: true,
             attribution: { name: `mailbox:${msg.from}`, icon: "📬" },
           },
@@ -65,7 +82,6 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
     } catch (e) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
 
-  // Setup watcher with retry on missing directory
   function setupWatcher(): AbortController | null {
     const ac = new AbortController();
     try {
@@ -76,52 +92,30 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
         }
       })().catch((e) => { console.error("[mailbox] watcher error:", e); });
       return ac;
-    } catch (e) {
-      console.error("[mailbox] watch setup failed (dir not ready?):", e);
-      return null;
-    }
+    } catch (e) { console.error("[mailbox] watch setup failed:", e); return null; }
   }
 
   watcherAc = setupWatcher();
 
-  // Fallback periodic poll (catches Syncthing edge cases + retries watch on missing dir)
   ctx.setInterval(() => {
     poll();
-    // Retry watcher setup if directory was previously missing
     if (!watcherAc) watcherAc = setupWatcher();
   }, POLL_MS);
 
-  // Immediate check after each agent turn
   pi.on("agent_end", poll);
-
-  // Cleanup on session end
-  pi.on("session_shutdown", () => {
-    if (watcherAc) watcherAc.abort();
-  });
+  pi.on("session_shutdown", () => { if (watcherAc) watcherAc.abort(); });
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-  // Fast path: identity already set at extension load
   const cfg = getConfig();
   if (cfg) { activate(pi, ctx, cfg); return; }
 
-  // Slash command: agent sets its mailbox identity during INIT
-  // Usage: /set_mailbox_username <session_id> <worker_id>
-  (pi as Record<string, unknown>).registerCommand?.("/set_mailbox_username", (args: string) => {
-    const parts = args.trim().split(/\s+/);
-    if (parts.length < 2) return "Usage: /set_mailbox_username <session_id> <worker_id>";
-    process.env.OMP_SESSION_ID = parts[0];
-    process.env.OMP_WORKER_ID = parts[1];
-    return `Mailbox identity set: session=${parts[0]}, worker=${parts[1]}. Plugin will activate on next agent_end.`;
-  });
-
-  // Deferred activation: first agent_end after identity is set
   let activated = false;
   pi.on("agent_end", () => {
     if (activated) return;
-    const cfg = getConfig();
-    if (!cfg) return;
-    activated = true;
-    activate(pi, ctx, cfg);
+    const envCfg = getConfig();
+    if (envCfg) { activated = true; activate(pi, ctx, envCfg); return; }
+    const fileCfg = getConfigFromFile();
+    if (fileCfg) { activated = true; activate(pi, ctx, fileCfg); return; }
   });
 }
