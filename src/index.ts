@@ -125,17 +125,10 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
 
   let activated = false;
   pi.on("agent_end", () => {
-    if (activated) return;
-    const envCfg = getConfig();
-    if (envCfg) {
-      activated = true;
-      activate(pi, ctx, envCfg);
-      return;
-    }
+    // File takes precedence — env may be stale from restored session
     const fileCfg = getConfigFromFile();
-    if (fileCfg) {
-      activated = true;
-      activate(pi, ctx, fileCfg);
-    }
-  });
+    const cfg = fileCfg ?? getConfig();
+    if (!cfg) return;
+    activated = true;
+    activate(pi, ctx, cfg);
 }
