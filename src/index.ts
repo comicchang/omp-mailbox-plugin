@@ -57,7 +57,7 @@ function setupWatcher(inboxDir: string, poll: () => void): AbortController | nul
       }
     })().catch((e) => { console.error("[mailbox] watcher error:", e); });
     return ac;
-  } catch { console.error("[mailbox] watch setup failed:", inboxDir); return null; }
+  } catch { return null; }  // inbox dir not ready — retry on next interval, no red noise
 }
 
 function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): void {
