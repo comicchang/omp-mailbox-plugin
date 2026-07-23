@@ -42,7 +42,7 @@ AGENT_ID_RE = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$"
 
 def resolve_root():
     return Path(os.environ.get("MAILBOX_ROOT") or
-                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/_mailbox"))
+                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/.mailbox"))
 
 
 def _validate_agent_id(aid: str):
