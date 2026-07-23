@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 
 const POLL_MS = 30_000;
 const CHECK_TIMEOUT_MS = 5_000;
 const MAX_DEDUP_IDS = 100;
-const IDENTITY_FILE = `${process.env.HOME}/.omp/mailbox-identity.json`;
 
 interface MailboxSummary {
   pending: number;
@@ -23,24 +23,39 @@ function getConfig(): Config | null {
   const sessionId = process.env.OMP_SESSION_ID;
   const agentId = process.env.OMP_WORKER_ID;
   if (!sessionId || !agentId) return null;
-  const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/.mailbox`;
+  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/Dropbox/logseq/pages/mi-docs/.mailbox`;
   const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
 
-/** Agent writes this during INIT via shell: echo '{"session_id":"s","worker_id":"w"}' > ~/.omp/mailbox-identity.json */
+/** Agent writes during INIT: echo '{"session_id":"s","worker_id":"w"}' > ~/.omp/<agent>/mailbox-identity.json */
+function identityPath(agentId?: string): string {
+  const dir = `${homedir()}/.omp/${agentId ?? ""}`;
+  try { require("node:fs").mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
+  return `${dir}/mailbox-identity.json`;
+}
+
 function getConfigFromFile(): Config | null {
-  try {
-    if (!existsSync(IDENTITY_FILE)) return null;
-    const data = JSON.parse(readFileSync(IDENTITY_FILE, "utf-8"));
-    const sessionId = data.session_id || data.sessionId;
-    const agentId = data.worker_id || data.agentId || data.workerId;
-    if (!sessionId || !agentId) return null;
-    const root = process.env.MAILBOX_ROOT ?? `${process.env.HOME}/Dropbox/logseq/pages/mi-docs/.mailbox`;
-    const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
-    console.error("[mailbox] identity loaded from file:", sessionId, agentId);
-    return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
-  } catch { return null; }
+  // Try per-agent file first (highest priority), then legacy global
+  const candidates = [
+    identityPath(process.env.OMP_WORKER_ID),
+    identityPath(),
+    identityPath("default"),
+  ];
+  for (const path of candidates) {
+    try {
+      if (!existsSync(path)) continue;
+      const data = JSON.parse(readFileSync(path, "utf-8"));
+      const sessionId = data.session_id || data.sessionId;
+      const agentId = data.worker_id || data.agentId || data.workerId;
+      if (!sessionId || !agentId) continue;
+      const root = process.env.MAILBOX_ROOT ?? `${homedir()}/Dropbox/logseq/pages/mi-docs/.mailbox`;
+      const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
+      console.error(`[mailbox] identity loaded: ${sessionId}/${agentId} from ${path}`);
+      return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
+    } catch { /* try next */ }
+  }
+  return null;
 }
 
 async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
@@ -82,28 +97,26 @@ function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config): void {
     } catch (e) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
 
-  function setupWatcher(): AbortController | null {
-    const ac = new AbortController();
-    try {
-      const watcher = Bun.watch(cfg.inboxDir, { signal: ac.signal, recursive: false });
-      (async () => {
-        for await (const event of watcher) {
-          if (event === "rename" || event === "create") poll();
-        }
-      })().catch((e) => { console.error("[mailbox] watcher error:", e); });
-      return ac;
-    } catch (e) { console.error("[mailbox] watch setup failed:", e); return null; }
-  }
-
-  watcherAc = setupWatcher();
-
-  ctx.setInterval(() => {
-    poll();
-    if (!watcherAc) watcherAc = setupWatcher();
-  }, POLL_MS);
-
+  watcherAc = setupWatcher(cfg.inboxDir, poll);
+  ctx.setInterval(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
   pi.on("agent_end", poll);
   pi.on("session_shutdown", () => { if (watcherAc) watcherAc.abort(); });
+
+  // Immediately check for existing inbox messages
+  poll();
+}
+
+function setupWatcher(inboxDir: string, poll: () => void): AbortController | null {
+  const ac = new AbortController();
+  try {
+    const watcher = Bun.watch(inboxDir, { signal: ac.signal, recursive: false });
+    (async () => {
+      for await (const event of watcher) {
+        if (event === "rename" || event === "create") poll();
+      }
+    })().catch((e) => { console.error("[mailbox] watcher error:", e); });
+    return ac;
+  } catch (e) { console.error("[mailbox] watch setup failed:", e); return null; }
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
@@ -114,8 +127,15 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
   pi.on("agent_end", () => {
     if (activated) return;
     const envCfg = getConfig();
-    if (envCfg) { activated = true; activate(pi, ctx, envCfg); return; }
+    if (envCfg) {
+      activated = true;
+      activate(pi, ctx, envCfg);
+      return;
+    }
     const fileCfg = getConfigFromFile();
-    if (fileCfg) { activated = true; activate(pi, ctx, fileCfg); return; }
+    if (fileCfg) {
+      activated = true;
+      activate(pi, ctx, fileCfg);
+    }
   });
 }
