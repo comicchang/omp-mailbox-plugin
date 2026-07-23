@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""mailbox session-health — diagnose mailbox connectivity in one shot.
+
+Usage:
+  mailbox session-health --session <id> --agent <id> [--json]
+
+Checks:
+  1. MAILBOX_ROOT env or default path resolves to an existing directory
+  2. Session directory + session.json exist and are valid
+  3. Agent inbox/processing/archive directories exist
+  4. CLI can list inbox files (ls via glob)
+  5. mailbox peek returns valid JSON with pending/messages
+  6. mailbox status can read/write status.json
+  7. OMP_SESSION_ID / OMP_WORKER_ID environment variables (if plugin mode)
+
+Exit 0 if all checks pass, 1 if any fail. Outputs JSON by default.
+"""
+
+import json, os, sys
+from pathlib import Path
+from datetime import datetime, timezone
+
+
+def resolve_root():
+    return Path(os.environ.get("MAILBOX_ROOT") or
+                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/.mailbox"))
+
+
+def check(session_id: str, agent_id: str) -> dict:
+    results = {"session_id": session_id, "agent_id": agent_id, "checks": [], "pass": True}
+
+    root = resolve_root()
+    sd = root / session_id
+
+    # 1. Root exists
+    ok = root.exists() and root.is_dir()
+    results["checks"].append({"name": "mailbox_root", "ok": ok, "detail": str(root)})
+    if not ok:
+        results["pass"] = False
+        return results
+
+    # 2. Session exists
+    sj = sd / "session.json"
+    ok = sd.exists() and sj.exists()
+    results["checks"].append({"name": "session_exists", "ok": ok, "detail": str(sd)})
+    if not ok:
+        results["pass"] = False
+        return results
+
+    # 3. Session.json is valid
+    try:
+        meta = json.loads(sj.read_bytes())
+        ok = "session_id" in meta and "manager" in meta and "agents" in meta
+        results["checks"].append({"name": "session_valid", "ok": ok,
+                                  "detail": f"manager={meta.get('manager')}, agents={meta.get('agents')}"})
+    except Exception as e:
+        results["checks"].append({"name": "session_valid", "ok": False, "detail": str(e)})
+        results["pass"] = False
+        return results
+
+    # 4. Agent dirs exist
+    for sub in ["inbox", "processing", "archive"]:
+        p = sd / agent_id / sub
+        ok = p.exists() and p.is_dir()
+        results["checks"].append({"name": f"agent_{sub}", "ok": ok, "detail": str(p)})
+        if not ok:
+            results["pass"] = False
+
+    # 5. Can list inbox
+    inbox = sd / agent_id / "inbox"
+    try:
+        files = list(inbox.glob("*.json"))
+        ok = True
+        results["checks"].append({"name": "list_inbox", "ok": ok,
+                                  "detail": f"{len(files)} files"})
+    except Exception as e:
+        results["checks"].append({"name": "list_inbox", "ok": False, "detail": str(e)})
+        results["pass"] = False
+
+    # 6. mailbox peek works
+    try:
+        import subprocess
+        cli = os.environ.get("MAILBOX_CLI", "mailbox")
+        proc = subprocess.run([cli, "peek", "--session", session_id, "--agent", agent_id],
+                            capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0 and proc.stdout.strip():
+            peek = json.loads(proc.stdout)
+            ok = "pending" in peek and "messages" in peek
+            results["checks"].append({"name": "peek_works", "ok": ok,
+                                      "detail": f"pending={peek.get('pending', '?')}"})
+        else:
+            results["checks"].append({"name": "peek_works", "ok": False,
+                                      "detail": f"exit={proc.returncode} stderr={proc.stderr[:80]}"})
+            results["pass"] = False
+    except Exception as e:
+        results["checks"].append({"name": "peek_works", "ok": False, "detail": str(e)})
+        results["pass"] = False
+
+    # 7. Status can be read/written
+    status_path = sd / agent_id / "status.json"
+    try:
+        # Write test status
+        test_status = {"state": "IDLE", "current_task": "health_check",
+                       "last_conclusion": "session-health probe",
+                       "session_id": session_id,
+                       "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        tmp = sd / agent_id / ".tmp-status-health.json"
+        tmp.write_text(json.dumps(test_status))
+        os.replace(str(tmp), str(status_path))
+        ok = status_path.exists()
+        results["checks"].append({"name": "status_rw", "ok": ok, "detail": str(status_path)})
+    except Exception as e:
+        results["checks"].append({"name": "status_rw", "ok": False, "detail": str(e)})
+        results["pass"] = False
+
+    # 8. OMP env vars (advisory)
+    omp_sid = os.environ.get("OMP_SESSION_ID", "")
+    omp_wid = os.environ.get("OMP_WORKER_ID", "")
+    ok = omp_sid == session_id and omp_wid == agent_id
+    results["checks"].append({"name": "omp_env", "ok": ok,
+                              "detail": f"OMP_SESSION_ID={'set' if omp_sid else 'MISSING'}, OMP_WORKER_ID={'set' if omp_wid else 'MISSING'}"})
+
+    return results
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="mailbox session-health")
+    p.add_argument("--session", required=True)
+    p.add_argument("--agent", required=True)
+    p.add_argument("--json", action="store_true", default=True)
+    args = p.parse_args()
+
+    result = check(args.session, args.agent)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    sys.exit(0 if result["pass"] else 1)
+
+
+if __name__ == "__main__":
+    main()
