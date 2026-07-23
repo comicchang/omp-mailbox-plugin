@@ -27,73 +27,58 @@ Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(trigger
 
 ## How it works
 
-The plugin uses `mailbox peek` — a **non-consuming** summary command that lists pending messages without archiving them. Actual consumption is done by the Worker agent at safe boundaries via `mailbox check` or `mailbox claim → process → check`.
+The plugin uses `mailbox peek` — a **non-consuming** summary command. The plugin
+**never consumes messages**. The agent decides when to consume via `mailbox read`.
 
-1. **Bun.watch** fires on `rename` or `create` events in the inbox directory (zero-latency).
-2. A **30-second interval** provides fallback coverage for Syncthing edge cases and watch failures.
-3. On **`agent_end`**, the plugin checks immediately after every completed agent turn.
-4. It calls `mailbox peek --worker <id>` to get a `{pending, messages[]}` summary.
-5. Duplicates are filtered via `msg_id` (bounded rolling Set, max 100).
-6. Each **new** message triggers `sendMessage({ triggerTurn: true })` with sender/kind/subject.
-
-Errors are logged to stderr via `console.error` with `[mailbox]` prefix — no silent failures.
+1. **Bun.watch** fires on `rename` or `create` events (zero-latency).
+2. A **30-second interval** provides fallback coverage.
+3. On **`agent_end`**, checks immediately after every completed turn.
+4. Calls `mailbox peek --session <id> --agent <id>` — reads pending count + summaries.
+5. Deduplicates via `msg_id` (bounded rolling Set, max 100).
+6. Each **new** message triggers `sendMessage({ triggerTurn: true })`.
 
 ## Usage
 
 **Send:**
 ```
-mailbox send --from ios-re --to ios-shader --subject "Glass done" --body "..." --kind EVIDENCE
+mailbox send --session <s> --from ios-re --to ios-shader --subject "Glass done" --body "..." --kind EVIDENCE
 ```
 
-**Receive** (automatic via plugin):
+**Receive** (plugin notifies, agent consumes):
 ```
-agent_end → mailbox peek → N pending → sendMessage(triggerTurn:true) → agent processes
-```
-
-**Idle detection** (dual mechanism):
-```
-Bun.watch(inboxDir)   → rename/create → immediate poll  (primary, zero latency)
-ctx.setInterval(30s)  → periodic poll                    (fallback, Syncthing edge cases)
+plugin: agent_end → mailbox peek → 1 pending → sendMessage(triggerTurn)
+agent:  receives notification → mailbox read --session <s> --agent ios-shader --owner ios-shader
+        → process → mailbox finalize --session <s> --agent ios-shader --msg-id <id> --owner ios-shader
 ```
 
-**Status update:**
+**Claim/consume pattern** (read auto-claims):
 ```
-mailbox status --worker ios-shader --state BUSY --current-task "glass shader"
-```
-
-**Claim/consume pattern** (for crash-safe processing):
-```
-mailbox claim   --worker ios-shader --msg-id ios-re_20260722T153000Z
-# ... process ...
-mailbox check   --worker ios-shader --json     # validate + archive
-```
+mailbox read    --session <s> --agent ios-shader --owner ios-shader   # reads + auto-claims
+mailbox finalize --session <s> --agent ios-shader --msg-id <id> --owner ios-shader
 
 ## Protocol
-
 Messages are atomic JSON files (`tmp → os.replace`), validated on consumption:
 
 ```json
-{"from":"ios-re","to":"ios-shader","subject":"...","body":"...",
- "kind":"REPORT","msg_id":"ios-re_20260722T153000Z","created_at":"..."}
+{"session_id":"sess_20260723T01_abc","from":"ios-re","to":"ios-shader",
+ "subject":"...","body":"...","kind":"REPORT",
+ "msg_id":"ios-re_20260723T153000Z_abc123","created_at":"..."}
 ```
 
-**7 required fields**: `from`, `to`, `subject`, `body`, `kind`, `msg_id`, `created_at`.
-
+**8 required fields**: `session_id`, `from`, `to`, `subject`, `body`, `kind`, `msg_id`, `created_at`.
 **Kinds**: TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE.
-
-Validation on `mailbox check`: all fields present, kind valid, `msg_id` matches filename, recipient matches inbox owner, no path separators in `msg_id`. Corrupt → `_corrupt/`.
 
 ## Directory Layout
 
 ```
 $MAILBOX_ROOT/
-  {worker_id}/
-    inbox/        ← Others write (Syncthing)
-    archive/      ← Validated + consumed
-    processing/   ← Claimed (exclusive, claim/release)
-    _corrupt/     ← Unparseable
-    status.json   ← {"state":"BUSY","current_task":"...","last_conclusion":"..."}
+  <session_id>/
+    session.json          # {manager, agents, created_at}
+    manager/inbox|processing|archive/
+    <agent>/inbox|processing|archive/status.json
 ```
+
+**Two-stage consumption**: `mailbox read` (reads + auto-claims to processing/) → agent processes → `mailbox finalize` (archives). `mailbox release` returns to inbox. `mailbox recover-stale` recovers expired claims (300s lease).
 
 ## License
 
