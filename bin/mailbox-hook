@@ -11,7 +11,7 @@ from pathlib import Path
 
 def resolve_root():
     return Path(os.environ.get("MAILBOX_ROOT") or
-                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/_mailbox"))
+                os.path.expanduser("~/.local/share/codeagent/mailbox"))
 
 
 def main(session_id: str, agent_id: str):

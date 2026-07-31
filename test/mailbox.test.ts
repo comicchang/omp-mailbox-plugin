@@ -3,73 +3,91 @@ import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const MAILBOX_CLI = join(import.meta.dir, "..", "..", "tmux-agent-skills", "tools", "mailbox");
+const MAILBOX_CLI = join(import.meta.dir, "..", "bin", "mailbox");
 const ROOT = join(tmpdir(), `omp-mailbox-test-${Date.now()}`);
-const WORKER = "test-worker";
+const SESSION = "sess1";
+const AGENT = "worker-a";
 
 function setup() {
-  for (const d of [join(ROOT, WORKER, "inbox"), join(ROOT, WORKER, "archive"), join(ROOT, WORKER, "_corrupt")]) {
-    mkdirSync(d, { recursive: true });
-  }
+  mkdirSync(join(ROOT, SESSION, AGENT, "inbox"), { recursive: true });
 }
 
 function teardown() {
   rmSync(ROOT, { recursive: true, force: true });
 }
 
-function writeMsg(filename: string, msg: Record<string, unknown>) {
-  writeFileSync(join(ROOT, WORKER, "inbox", filename), JSON.stringify(msg));
+function run(args: string[], env: Record<string, string> = {}) {
+  return Bun.spawnSync([MAILBOX_CLI, ...args], {
+    env: { ...process.env, MAILBOX_ROOT: ROOT, ...env },
+  });
 }
 
-function spawnCheck(json: boolean) {
-  const args = json ? [MAILBOX_CLI, "check", "--worker", WORKER, "--json"] : [MAILBOX_CLI, "check", "--worker", WORKER];
-  return Bun.spawnSync(args, { env: { ...process.env, MAILBOX_ROOT: ROOT } });
+function writeMsg(filename: string, msg: Record<string, unknown>) {
+  writeFileSync(join(ROOT, SESSION, AGENT, "inbox", filename), JSON.stringify(msg));
 }
 
 describe("mailbox", () => {
   beforeAll(setup);
   afterAll(teardown);
 
-  test("empty inbox returns nothing", () => {
-    const proc = spawnCheck(true);
-    expect(proc.stdout.toString()).toBe("");
+  test("empty inbox returns empty summary", () => {
+    const proc = run(["peek", "--session", SESSION, "--agent", AGENT]);
     expect(proc.exitCode).toBe(0);
+    const out = JSON.parse(proc.stdout.toString());
+    expect(out.pending).toBe(0);
+    expect(out.messages).toHaveLength(0);
   });
 
-  test("message is read, validated, and archived", () => {
-    writeMsg("sender_20260722T120000Z.json", {
-      from: "sender", to: WORKER, subject: "test", body: "hello",
-      kind: "REPORT", msg_id: "sender_20260722T120000Z",
-      created_at: "2026-07-22T12:00:00Z",
+  test("peek sees a message without consuming it", () => {
+    writeMsg("mgr_20260722T120000Z.json", {
+      session_id: SESSION, from: "mgr", to: AGENT,
+      subject: "test", body: "hello", kind: "REPORT",
+      msg_id: "mgr_20260722T120000Z", created_at: "2026-07-22T12:00:00Z",
     });
 
-    const proc = spawnCheck(false);
-    const out = proc.stdout.toString();
-    expect(out).toContain("FROM:");
-    expect(out).toContain("sender");
+    const proc = run(["peek", "--session", SESSION, "--agent", AGENT]);
     expect(proc.exitCode).toBe(0);
-
-    expect(existsSync(join(ROOT, WORKER, "archive", "sender_20260722T120000Z.json"))).toBe(true);
-    expect(existsSync(join(ROOT, WORKER, "inbox", "sender_20260722T120000Z.json"))).toBe(false);
+    const out = JSON.parse(proc.stdout.toString());
+    expect(out.pending).toBe(1);
+    expect(out.messages[0].subject).toBe("test");
+    // peek is non-consuming
+    expect(existsSync(join(ROOT, SESSION, AGENT, "inbox", "mgr_20260722T120000Z.json"))).toBe(true);
   });
 
-  test("corrupt message goes to _corrupt", () => {
-    writeFileSync(join(ROOT, WORKER, "inbox", "bad.json"), "not json");
+  test("read claims, finalize archives", () => {
+    const read = run(["read", "--session", SESSION, "--agent", AGENT, "--owner", AGENT]);
+    expect(read.exitCode).toBe(0);
+    expect(read.stdout.toString()).toContain("FROM:");
+    expect(read.stdout.toString()).toContain("mgr");
 
-    const proc = spawnCheck(true);
-    expect(proc.stdout.toString()).toBe("");
-    expect(existsSync(join(ROOT, WORKER, "_corrupt", "bad.json"))).toBe(true);
+    const fin = run(["finalize", "--session", SESSION, "--agent", AGENT,
+      "--msg-id", "mgr_20260722T120000Z", "--owner", AGENT]);
+    expect(fin.exitCode).toBe(0);
+    expect(existsSync(join(ROOT, SESSION, AGENT, "archive", "mgr_20260722T120000Z.json"))).toBe(true);
+    expect(existsSync(join(ROOT, SESSION, AGENT, "inbox", "mgr_20260722T120000Z.json"))).toBe(false);
+  });
+
+  test("corrupt message is skipped by peek, archived by read", () => {
+    writeFileSync(join(ROOT, SESSION, AGENT, "inbox", "bad.json"), "not json");
+
+    // peek is read-only: tolerates the corrupt file without crashing
+    const proc = run(["peek", "--session", SESSION, "--agent", AGENT]);
+    expect(proc.exitCode).toBe(0);
+
+    // read consumes it: corrupt file moves to _corrupt
+    const rd = run(["read", "--session", SESSION, "--agent", AGENT, "--owner", AGENT]);
+    expect(rd.exitCode).toBe(0);
+    expect(existsSync(join(ROOT, SESSION, AGENT, "_corrupt", "bad.json"))).toBe(true);
+    expect(existsSync(join(ROOT, SESSION, AGENT, "inbox", "bad.json"))).toBe(false);
   });
 
   test("status writes atomically", () => {
-    Bun.spawnSync([MAILBOX_CLI, "status", "--worker", WORKER, "--state", "BUSY",
-      "--current-task", "test", "--last-conclusion", "testing"], {
-      env: { ...process.env, MAILBOX_ROOT: ROOT },
-    });
+    const st = run(["status", "--session", SESSION, "--agent", AGENT,
+      "--state", "BUSY", "--current-task", "test"]);
+    expect(st.exitCode).toBe(0);
 
-    const status = JSON.parse(readFileSync(join(ROOT, WORKER, "status.json"), "utf-8"));
+    const status = JSON.parse(readFileSync(join(ROOT, SESSION, AGENT, "status.json"), "utf-8"));
     expect(status.state).toBe("BUSY");
     expect(status.current_task).toBe("test");
-    expect(status.last_conclusion).toBe("testing");
   });
 });

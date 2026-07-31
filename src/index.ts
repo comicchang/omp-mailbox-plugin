@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, watch as fsWatch } from "node:fs";
 import { homedir } from "node:os";
 
 const POLL_MS = 30_000;
@@ -21,7 +21,7 @@ interface Config {
 }
 
 function buildConfig(sessionId: string, agentId: string): Config {
-  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/Dropbox/logseq/pages/mi-docs/.mailbox`;
+  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/codeagent/mailbox`;
   const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
@@ -39,8 +39,11 @@ function readIdentityFile(path: string): Config | null {
 }
 
 async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
+  // Pass MAILBOX_ROOT explicitly: peek reads the configured root, not the
+  // ambient environment (which may point elsewhere or be unset).
   const proc = Bun.spawn([cfg.cliPath, "peek", "--session", cfg.sessionId, "--agent", cfg.agentId], {
     stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS,
+    env: { ...process.env, MAILBOX_ROOT: cfg.mailboxRoot },
   });
   const out = await new Response(proc.stdout).text();
   if (!out.trim()) return null;
@@ -50,17 +53,27 @@ async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
 function setupWatcher(inboxDir: string, poll: () => void): AbortController | null {
   const ac = new AbortController();
   try {
-    const watcher = Bun.watch(inboxDir, { signal: ac.signal, recursive: false });
-    (async () => {
-      for await (const event of watcher) {
-        if (event === "rename" || event === "create") poll();
-      }
-    })().catch((e) => { console.error("[mailbox] watcher error:", e); });
+    // Bun.watch is not available on all Bun versions; Node's fs.watch is
+    // stable across them. 'rename' fires for create/delete/rename — poll()
+    // is idempotent (msg_id dedup) so redundant events are harmless.
+    //
+    // Keep the watcher reachable: a bare local variable gets GC'd by Bun
+    // and events silently stop firing. Attach it to the returned
+    // AbortController so the caller holds the only strong reference.
+    const watcher = fsWatch(inboxDir, { signal: ac.signal }, () => {
+      poll();
+    });
+    watcher.on("error", (e) => {
+      console.error("[mailbox] watcher error:", e);
+    });
+    (ac as AbortController & { _watcher?: unknown })._watcher = watcher;
     return ac;
-  } catch { return null; }  // inbox dir not ready — retry on next interval, no red noise
+  } catch {
+    return null; // inbox dir not ready — retry on next interval, no red noise
+  }
 }
 
-function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): void {
+export function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): void {
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
