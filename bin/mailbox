@@ -41,8 +41,14 @@ AGENT_ID_RE = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$"
 
 
 def resolve_root():
-    return Path(os.environ.get("MAILBOX_ROOT") or
-                os.path.expanduser("~/.local/share/codeagent/mailbox"))
+    # Prefer codeagent's canonical resolver when installed; fall back to
+    # the identical XDG default so the plugin stays zero-dependency.
+    try:
+        from codeagent.mailbox.store import resolve_root as _core_resolve
+        return _core_resolve()
+    except Exception:
+        return Path(os.environ.get("MAILBOX_ROOT") or
+                    os.path.expanduser("~/.local/share/codeagent/mailbox"))
 
 
 def _validate_agent_id(aid: str):
