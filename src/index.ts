@@ -6,13 +6,14 @@ const POLL_MS = 30_000;
 const IDENTITY_POLL_MS = 2_000;
 const CHECK_TIMEOUT_MS = 5_000;
 const MAX_DEDUP_IDS = 100;
+const MAILBOX_MIN_VERSION = "0.1.0";
 
 interface MailboxSummary {
   pending: number;
   messages: { from: string; kind: string; subject: string; msg_id: string }[];
 }
 
-interface Config {
+export interface Config {
   sessionId: string;
   agentId: string;
   mailboxRoot: string;
@@ -22,8 +23,49 @@ interface Config {
 
 function buildConfig(sessionId: string, agentId: string): Config {
   const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/codeagent/mailbox`;
-  const cli = process.env.MAILBOX_CLI ?? `${import.meta.dir}/../bin/mailbox`;
+  const cli = process.env.MAILBOX_CLI ?? "mailbox";
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
+}
+
+function versionGte(actual: string, required: string): boolean {
+  const pa = actual.split(".").map(Number);
+  const pr = required.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pr.length); i++) {
+    const a = pa[i] ?? 0;
+    const r = pr[i] ?? 0;
+    if (a > r) return true;
+    if (a < r) return false;
+  }
+  return true;
+}
+
+async function checkMailboxCli(cliPath: string): Promise<void> {
+  try {
+    // Try codeagent --version first (canonical package provides mailbox + codeagent)
+    const proc = Bun.spawn(["codeagent", "--version"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
+    const out = await new Response(proc.stdout).text();
+    const match = out.match(/(\d+\.\d+\.\d+)/);
+    if (match && proc.exitCode === 0) {
+      if (!versionGte(match[1], MAILBOX_MIN_VERSION)) {
+        console.error(`[mailbox] codeagent version ${match[1]} < required ${MAILBOX_MIN_VERSION}. Please upgrade codeagent.`);
+        throw new Error(`mailbox CLI version too old: ${match[1]} < ${MAILBOX_MIN_VERSION}`);
+      }
+      return; // version OK
+    }
+  } catch { /* fall through to existence check */ }
+
+  // Fallback: verify the CLI is at least callable (e.g. 'mailbox --help' exits 0)
+  try {
+    const proc = Bun.spawn([cliPath, "--help"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+      console.error(`[mailbox] CLI '${cliPath}' is not callable (exit ${proc.exitCode}). Is codeagent installed? (pipx install codeagent-py)`);
+      throw new Error(`mailbox CLI not functional: ${cliPath}`);
+    }
+  } catch (e) {
+    console.error(`[mailbox] CLI '${cliPath}' not found in PATH. Set MAILBOX_CLI or install codeagent (pipx install codeagent-py).`);
+    throw new Error(`mailbox CLI not found: ${cliPath}`);
+  }
 }
 
 function readIdentityFile(path: string): Config | null {
@@ -73,7 +115,9 @@ function setupWatcher(inboxDir: string, poll: () => void): AbortController | nul
   }
 }
 
-export function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): void {
+export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, identityPath: string): Promise<void> {
+  await checkMailboxCli(cfg.cliPath);
+
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
@@ -88,14 +132,14 @@ export function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Config, i
         if (seen.has(msg.msg_id)) continue;
         seen.add(msg.msg_id);
         if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
-        (pi as Record<string, unknown>).sendMessage?.(
+        pi.sendMessage(
           { customType: "omp-mailbox", display: true,
             content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> notification — run mailbox read to consume`,
             details: { from: msg.from, kind: msg.kind } },
           { triggerTurn: true, deliverAs: "nextTurn" },
         );
       }
-    } catch (e) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
+    } catch (e: unknown) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
 
   watcherAc = setupWatcher(cfg.inboxDir, poll);
@@ -122,7 +166,9 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
     const cfg = readIdentityFile(identityPath);
     if (!cfg) return;
     clearInterval(idInterval);
-    activate(pi, ctx, cfg, identityPath);
+    activate(pi, ctx, cfg, identityPath).catch((e: unknown) => {
+      console.error("[mailbox] activation failed:", e);
+    });
   }, IDENTITY_POLL_MS);
 
   pi.on("session_shutdown", () => {

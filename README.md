@@ -12,6 +12,23 @@ Worker A:  mailbox send --session <id> --from A --to B → <session>/B/inbox/{ms
 Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(triggerTurn) → read → finalize (auto-claim)
 ```
 
+## Prerequisites
+
+This plugin is a **thin notification adapter**. It delegates all mailbox operations to the
+canonical `mailbox` CLI from [codeagent-py](https://github.com/anthropics/codeagent-py).
+
+Install the CLI first:
+
+```bash
+pipx install codeagent-py        # installs 'mailbox' + 'codeagent' into PATH
+```
+
+On activation the plugin runs a capability check:
+- Verifies `codeagent --version` returns 0 and version >= `MAILBOX_MIN_VERSION` (currently `0.1.0`);
+- Falls back to verifying `mailbox --help` exits successfully.
+
+If the check fails the plugin logs an error and throws — it does **not** silently degrade.
+
 ## Installation
 
     omp install git:github.com/comicchang/omp-mailbox-plugin
@@ -23,7 +40,7 @@ Worker B:  Bun.watch("rename"|"create") → mailbox peek → sendMessage(trigger
 | `OMP_SESSION_ID` | Yes | Session identifier (same across session agents) |
 | `OMP_WORKER_ID` | Yes | Agent ID matching inbox directory |
 | `MAILBOX_ROOT` | No | Path to mailbox root (default: `~/.local/share/codeagent/mailbox`) |
-| `MAILBOX_CLI` | No | Path to `mailbox` CLI (default: bundled `bin/mailbox` alongside plugin) |
+| `MAILBOX_CLI` | No | Path to `mailbox` CLI (default: `mailbox` from PATH) |
 
 ## How it works
 
@@ -34,29 +51,11 @@ The plugin uses `mailbox peek` — a **non-consuming** summary command. The plug
 2. A **30-second interval** provides fallback coverage.
 3. On **`agent_end`**, checks immediately after every completed turn.
 4. Calls `mailbox peek --session <id> --agent <id>` — reads pending count + summaries.
-5. Deduplicates via `msg_id` (bounded rolling Set, max 100).
+5. Deduplicates via `msg_id` (bounded rolling set, max 100).
 6. Each **new** message triggers `sendMessage({ triggerTurn: true })`.
 
-## Usage
-
-**Send:**
-```
-mailbox send --session <s> --from ios-re --to ios-shader --subject "Glass done" --body "..." --kind EVIDENCE
-```
-
-**Receive** (plugin notifies, agent consumes):
-```
-plugin: agent_end → mailbox peek → 1 pending → sendMessage(triggerTurn)
-agent:  receives notification → mailbox read --session <s> --agent ios-shader --owner ios-shader
-        → process → mailbox finalize --session <s> --agent ios-shader --msg-id <id> --owner ios-shader
-```
-
-**Claim/consume pattern** (read auto-claims):
-```
-mailbox read    --session <s> --agent ios-shader --owner ios-shader   # reads + auto-claims
-mailbox finalize --session <s> --agent ios-shader --msg-id <id> --owner ios-shader
-
 ## Protocol
+
 Messages are atomic JSON files (`tmp → os.replace`), validated on consumption:
 
 ```json
@@ -67,6 +66,25 @@ Messages are atomic JSON files (`tmp → os.replace`), validated on consumption:
 
 **8 required fields**: `session_id`, `from`, `to`, `subject`, `body`, `kind`, `msg_id`, `created_at`.
 **Kinds**: TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE.
+
+See `mailbox --help` for all available subcommands (send, peek, read, finalize, release, etc.).
+
+## Development
+
+Typecheck and test gate:
+
+```bash
+bun install
+bun run typecheck    # tsc --noEmit — 0 errors required
+bun test             # wake tests
+```
+
+CI script (from codeagent-py repo):
+
+```bash
+./scripts/check-plugin-types.sh         # defaults to ../omp-mailbox-plugin
+./scripts/check-plugin-types.sh /path/to/plugin  # explicit path
+```
 
 ## Directory Layout
 

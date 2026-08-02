@@ -3,6 +3,18 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { activate, type Config } from "../src/index";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+// Check if canonical mailbox CLI is available on PATH
+let MAILBOX_ON_PATH = true;
+try {
+  const proc = Bun.spawnSync(["mailbox", "--help"], { stdout: "pipe", stderr: "pipe" });
+  if (proc.exitCode !== 0) MAILBOX_ON_PATH = false;
+} catch {
+  MAILBOX_ON_PATH = false;
+}
+
+const describeOrSkip = MAILBOX_ON_PATH ? describe : describe.skip;
 
 // Mock ExtensionAPI — named types, no inline imports / ReturnType.
 interface SentMessage {
@@ -35,7 +47,7 @@ function cfg(root: string, sid = "sess1", wid = "worker-a"): Config {
     sessionId: sid,
     agentId: wid,
     mailboxRoot: root,
-    cliPath: join(import.meta.dir, "..", "bin", "mailbox"),
+    cliPath: process.env.MAILBOX_CLI ?? "mailbox",
     inboxDir: `${root}/${sid}/${wid}/inbox`,
   };
 }
@@ -50,7 +62,7 @@ async function until(fn: () => boolean, ms = 3000, step = 100): Promise<void> {
   throw new Error(`condition not met within ${ms}ms`);
 }
 
-describe("omp-mailbox-plugin wake-up", () => {
+describeOrSkip("omp-mailbox-plugin wake-up", () => {
   const ROOT = join(tmpdir(), `omp-mailbox-wake-${Date.now()}`);
   const mailboxRoot = join(ROOT, "mailbox");
   const identityPath = join(ROOT, "identity.json");
@@ -69,7 +81,7 @@ describe("omp-mailbox-plugin wake-up", () => {
   });
 
   test("new inbox message triggers sendMessage with triggerTurn (wakes idle agent)", async () => {
-    activate(api.pi, {} as never, cfg(mailboxRoot), identityPath);
+    await activate(api.pi as unknown as ExtensionAPI, {} as never, cfg(mailboxRoot), identityPath);
 
     const msg = {
       session_id: "sess1", from: "mgr", to: "worker-a",
@@ -84,7 +96,7 @@ describe("omp-mailbox-plugin wake-up", () => {
   });
 
   test("duplicate msg_id does not re-notify", async () => {
-    activate(api.pi, {} as never, cfg(mailboxRoot), identityPath);
+    await activate(api.pi as unknown as ExtensionAPI, {} as never, cfg(mailboxRoot), identityPath);
 
     const msg = {
       session_id: "sess1", from: "mgr", to: "worker-a",
