@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { readFileSync, existsSync, unlinkSync, watch as fsWatch } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, writeFileSync, watch as fsWatch } from "node:fs";
 import { homedir } from "node:os";
 
 const POLL_MS = 30_000;
@@ -155,11 +155,9 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
   // ── load marker（oracle-lite P1 诊断）：区分「extension 未被加载」vs「被调用但失败」
-  // OMP 17.2.4 下自动发现疑似不加载本扩展；此 marker 用于确认加载管线行为。
+  // 注意：ESM 下不可用 require()（ReferenceError）——用 fs 命名导入。
   try {
-    const { writeFileSync } = require("node:fs");
     writeFileSync(`/tmp/omp-mb-load-${process.pid}.json`, JSON.stringify({
       pid: process.pid,
       identity_env: !!process.env.OMP_MAILBOX_IDENTITY_FILE,
