@@ -155,7 +155,18 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
 }
 
 export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
-  // Identity file path injected by launcher at startup (OS-level env inherit)
+export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
+  // ── load marker（oracle-lite P1 诊断）：区分「extension 未被加载」vs「被调用但失败」
+  // OMP 17.2.4 下自动发现疑似不加载本扩展；此 marker 用于确认加载管线行为。
+  try {
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(`/tmp/omp-mb-load-${process.pid}.json`, JSON.stringify({
+      pid: process.pid,
+      identity_env: !!process.env.OMP_MAILBOX_IDENTITY_FILE,
+      loaded_at: new Date().toISOString(),
+    }));
+  } catch { /* diagnostic only */ }
+
   const identityPath = process.env.OMP_MAILBOX_IDENTITY_FILE;
   if (!identityPath) {
     return;  // Manager session — no mailbox monitoring needed
@@ -163,7 +174,13 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
 
   // Poll for agent-written identity JSON every2s; activate when found
   const idInterval = setInterval(() => {
-    const cfg = readIdentityFile(identityPath);
+    let cfg: Config | null = null;
+    try {
+      cfg = readIdentityFile(identityPath);
+    } catch (e: unknown) {
+      console.error("[mailbox] identity read error:", e);
+      return;
+    }
     if (!cfg) return;
     clearInterval(idInterval);
     activate(pi, ctx, cfg, identityPath).catch((e: unknown) => {
