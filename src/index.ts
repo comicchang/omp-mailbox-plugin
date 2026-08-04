@@ -72,6 +72,23 @@ function readIdentityFile(path: string): Config | null {
   try {
     if (!existsSync(path)) return null;
     const data = JSON.parse(readFileSync(path, "utf-8"));
+
+    // Stale identity guard: if owner_pid is present and process is dead, skip
+    const ownerPid = data.owner_pid as number | undefined;
+    if (ownerPid) {
+      try {
+        process.kill(ownerPid, 0); // signal 0 = existence check
+      } catch {
+        return null; // PID no longer alive — stale identity
+      }
+    }
+
+    // Nonce guard: if identity has a nonce, it must match the launcher's expected nonce
+    const expectedNonce = process.env.OMP_MAILBOX_NONCE;
+    if (data.nonce && expectedNonce && data.nonce !== expectedNonce) {
+      return null; // nonce mismatch — identity from a different launcher
+    }
+
     const sid = data.session_id ?? data.sessionId;
     const wid = data.worker_id ?? data.agentId ?? data.workerId;
     if (!sid || !wid) return null;
