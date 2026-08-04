@@ -121,17 +121,49 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
+  const sentAt = new Map<string, number>(); // msg_id → last send ts（窗口内同 id 不重发）
+  const RETRY_MS = 60_000;
+
+  // pi.sendMessage() 是同步返回、异步完成（内部 sendCustomMessage().catch）——
+  // 同步 try/catch 捕获不到异步失败。去重策略（三层）：
+  // ① 同步 throw（payload 非法/runtime 未初始化）→ catch → 不记录 → 下轮重发
+  // ② 同 msg_id 在 RETRY_MS 窗口内不重发（防文件更新触发重复通知）
+  // ③ send 后延迟 CHECK 秒再 peek：消息已被 agent read 消费（不再 pending）
+  //    → 永久 seen；仍 pending → 窗口过期后下一轮 poll 重发（消息确实未处理，
+  //    通知可能在异步阶段丢失——oracle 红线：不允许永久去重未送达消息）
+  function scheduleSeenAfterConsumed(msgId: string): void {
+    setTimeout(() => {
+      runPeek(cfg).then((r) => {
+        const stillPending = r?.messages.some((m) => m.msg_id === msgId) ?? false;
+        try {
+          writeFileSync(`/tmp/omp-ack-${process.pid}.json`, JSON.stringify({
+            ts: new Date().toISOString(), msg_id: msgId, still_pending: stillPending,
+          }));
+        } catch { /* diagnostic only */ }
+        if (!stillPending) {
+          seen.add(msgId);
+          if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+        }
+      }).catch(() => { /* keep un-seen; retry next poll */ });
+    }, CHECK_TIMEOUT_MS);
+  }
 
   async function poll(): Promise<void> {
     if (polling) return;
     polling = true;
     try {
       const result = await runPeek(cfg);
+      try {
+        writeFileSync(`/tmp/omp-poll-${process.pid}.json`, JSON.stringify({
+          ts: new Date().toISOString(), pending: result?.pending ?? -1,
+          msgs: result?.messages.map((m) => m.msg_id) ?? [],
+        }));
+      } catch { /* diagnostic only */ }
       if (!result || result.messages.length === 0) return;
       for (const msg of result.messages) {
         if (seen.has(msg.msg_id)) continue;
-        // Oracle 验证：先 send 成功再加入 seen——若 send 抛错（runtime 未绑定），
-        // 消息不能被永久去重（否则永远不再唤醒）。
+        const lastSent = sentAt.get(msg.msg_id);
+        if (lastSent !== undefined && Date.now() - lastSent < RETRY_MS) continue;
         try {
           pi.sendMessage(
             { customType: "omp-mailbox", display: true,
@@ -139,12 +171,21 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
               details: { from: msg.from, kind: msg.kind } },
             { triggerTurn: true, deliverAs: "nextTurn" },
           );
+          sentAt.set(msg.msg_id, Date.now());
+          if (sentAt.size > MAX_DEDUP_IDS) {
+            const oldest = sentAt.keys().next().value!;
+            sentAt.delete(oldest);
+          }
+          try {
+            writeFileSync(`/tmp/omp-send-${process.pid}.json`, JSON.stringify({
+              ts: new Date().toISOString(), msg_id: msg.msg_id,
+            }));
+          } catch { /* diagnostic only */ }
         } catch (e: unknown) {
           console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
           continue;
         }
-        seen.add(msg.msg_id);
-        if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+        scheduleSeenAfterConsumed(msg.msg_id);
       }
     } catch (e: unknown) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
