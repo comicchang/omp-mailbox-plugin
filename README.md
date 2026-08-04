@@ -71,8 +71,8 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 
 ### 唤醒的可靠 Fallback（agent 轮询）
 
-OMP 17.2.x 的 extension 加载有竞态缺陷（见「已知问题」），触发式唤醒不可靠时，
-**prompt 引导 agent 定期 `codeagent mailbox peek` 轮询**——100% 可用（不依赖 extension 管线）。
+触发式唤醒（fs.watch → triggerTurn）依赖 OMP extension 正常运行；作为补充，
+**prompt 引导 agent 定期 `codeagent mailbox peek` 轮询**同样可用（不依赖唤醒通知）。
 
 ## 协议
 
@@ -88,15 +88,28 @@ OMP 17.2.x 的 extension 加载有竞态缺陷（见「已知问题」），触�
 **两阶段消费**：`mailbox read`（inbox→processing）→ 处理 → `mailbox finalize`（→archive）；`release` 退回 inbox；`recover-stale` 恢复过期 claim（300s lease）。
 跨主机：`codeagent mailbox ... --host <alias>`；高级 IPC：`codeagent swarm ...`。
 
-## 已知问题（OMP 17.2.x extension 加载竞态）
+## 诊断（加载与激活判据）
 
-- **症状**：`omp` 裸启动/`--extension` 时 extension **随机不加载**（插件未激活、无 `[mailbox] identity` 日志、inbox 新消息不唤醒）；`omp plugin doctor` 全 OK 但运行时不生效
-- **根因**：OMP extension 加载管线（loadLegacyPiModule/withHostGuard，Bun import）非确定性 + 错误静默吞掉（OMP_DEBUG 也无日志）。web_search 有同类公开报告（2026-05/06）
-- **证据**：最小 10 行零依赖 extension `--extension`×5 全失败；自动发现（extensions/、config.yml#extensions、settings.json#extensions、plugin install/link）0%；17.2.4→17.2.5 有改善（1/3→3/4）未根除
-- **缓解**：
-  - 用 `omp-mailbox` 启动包装（`--extension`，dotai setup 生成）
-  - 或 prompt 引导 agent 轮询 mailbox peek（100% 可靠）
-  - issue 证据包：`docs/omp-17.2.4-extension-loading-issue.md`（可提交 can1357/oh-my-pi）
+**注意**：extension 的裸 `console.log/warn` **不是可靠判据**——OMP 集中 logger 不
+monkey-patch console；裸 console 走 stdout/stderr，macOS 交互 TUI 下 fd2 仅在其
+持有终端期间被重定向到 PID 日志（stderr-guard），时序决定是否进日志文件。
+
+**可靠三层判据**（Oracle 验证）：
+1. **load marker**：extension default export 的副作用（如写文件）——确认模块加载 + factory 执行
+2. **有效 identity**：`OMP_MAILBOX_IDENTITY_FILE` 指向的 JSON `session_id`/`worker_id` **均非空**
+   （空 worker_id → 插件 readIdentityFile 拒绝 → activate 永不进入）
+3. **activation / 真实 wake**：激活后向 inbox 发唯一 msg_id，验证会话出现
+   `customType:"omp-mailbox"` 通知 + agent 实际处理（不依赖日志 grep）
+
+插件日志应使用 `pi.logger.*`（稳定进 OMP 结构化日志）；裸 console 仅作 stderr/TUI 诊断。
+
+## 已知问题（激活前置条件）
+
+- **launcher identity 必须非空**：`codeagent run --backend omp` 注入的 identity 若
+  `worker_id` 为空（环境无 `OMP_WORKER_ID`），插件不会 activate。已修复（缺省 "worker"）；
+  调用方应显式设 `OMP_WORKER_ID` 匹配 inbox 目录。
+- **激活时序**：default export 执行 ≠ activate 完成（activate 异步 poll identity + 注册
+  watcher/handlers）。消息可能早于 watcher 就绪——agent 轮询 `mailbox peek` 兜底。
 
 ## 开发
 
@@ -115,8 +128,8 @@ CI（codeagent-py repo）：
 
 ## 诊断
 
-- 加载 marker：plugin default export 开头写 `/tmp/omp-mb-load-<pid>.json`（区分「未加载」vs「加载失败」——注意 ESM 下勿用 require）
-- 激活日志：`[mailbox] identity: <sid>/<wid>`（activate 的 console.warn → OMP 日志）
+- **加载判据**：extension default export 的副作用（marker 文件等）——勿用裸 console 日志（见「诊断」三层判据）
+- **激活判据**：有效非空 identity + activation marker / 真实 wake（`customType:"omp-mailbox"` 通知 + agent 处理）
 
 ## License
 

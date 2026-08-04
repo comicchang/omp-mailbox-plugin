@@ -44,9 +44,9 @@ ls node_modules/omp-mailbox-plugin/src/index.ts   # 验证
 
 ```bash
 PLUGIN_ENTRY="${PLUGIN_ROOT}/node_modules/omp-mailbox-plugin/src/index.ts"
-omp config set extensions "[\"${PLUGIN_ENTRY}\"]"   # 官方配置（OMP 修复自动加载后生效）
+omp config set extensions "[\"${PLUGIN_ENTRY}\"]"   # 官方配置
 
-# 生成 omp-mailbox 启动包装（当前 OMP 17.2.x 的可靠加载路径）
+# 生成 omp-mailbox 启动包装（启动便利项，可选）
 mkdir -p "${HOME}/.local/bin"
 cat > "${HOME}/.local/bin/omp-mailbox" <<EOF
 #!/bin/sh
@@ -65,14 +65,13 @@ ls "${PLUGIN_ENTRY}"                      # 期望存在
 #   OMP_MAILBOX_AGENT_ID=w1 \
 #   OMP_MAILBOX_IDENTITY_FILE=<(echo '{"session_id":"s1","worker_id":"w1"}') \
 #   omp-mailbox "你是 w1，等待 mailbox 消息"
-# 激活验证：grep '\[mailbox\] identity' ~/.omp/logs/omp.*.log
+# 激活验证（三层判据）：① load marker 副作用 ② identity 非空 ③ 真实 wake
+#   （发唯一 msg_id → 会话出现 omp-mailbox 通知 + agent 处理）
 ```
 
 ## 已知限制（遇到时向用户说明）
 
-1. **OMP 17.2.x extension 加载竞态**：`omp-mailbox`（--extension）约 75% 成功率、
-   自动发现 0%——**可靠 fallback 是 agent 轮询**（prompt 引导定期
-   `codeagent mailbox peek`）。issue 证据包见插件仓库 `docs/`。
+1. **激活前置**：identity 的 worker_id 必须非空（launcher 已修复缺省 `worker`；调用方应显式设 OMP_WORKER_ID）。
 2. **跨主机**：发送方需 codeagent CLI + SSH 通路（`codeagent swarm direct ... --host <alias>`）。
 3. 非 OMP agent（opencode/codex）不需要本插件——直接用 `codeagent mailbox`/`swarm` CLI。
 

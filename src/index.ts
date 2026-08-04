@@ -130,14 +130,21 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
       if (!result || result.messages.length === 0) return;
       for (const msg of result.messages) {
         if (seen.has(msg.msg_id)) continue;
+        // Oracle 验证：先 send 成功再加入 seen——若 send 抛错（runtime 未绑定），
+        // 消息不能被永久去重（否则永远不再唤醒）。
+        try {
+          pi.sendMessage(
+            { customType: "omp-mailbox", display: true,
+              content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> notification — run mailbox read to consume`,
+              details: { from: msg.from, kind: msg.kind } },
+            { triggerTurn: true, deliverAs: "nextTurn" },
+          );
+        } catch (e: unknown) {
+          console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
+          continue;
+        }
         seen.add(msg.msg_id);
         if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
-        pi.sendMessage(
-          { customType: "omp-mailbox", display: true,
-            content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> notification — run mailbox read to consume`,
-            details: { from: msg.from, kind: msg.kind } },
-          { triggerTurn: true, deliverAs: "nextTurn" },
-        );
       }
     } catch (e: unknown) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
