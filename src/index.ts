@@ -213,7 +213,8 @@ export async function activate(pi: ExtensionAPI, ctx: ExtensionContext, cfg: Con
   pi.on("session_shutdown", () => {
     if (watcherAc) watcherAc.abort();
     clearInterval(interval);
-    try { unlinkSync(identityPath); } catch { /* ok */ }
+    // identity 文件由 launcher（OMPRunner）管理生命周期，plugin 不删除。
+    // 当 agent HOT_PARKED 时，launcher 跳过删除以保留 revive 能力。
   });
 
   poll();
@@ -253,6 +254,6 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
 
   pi.on("session_shutdown", () => {
     clearInterval(idInterval);
-    try { unlinkSync(identityPath); } catch { /* ok */ }
+    // identity 由 launcher 管理，plugin 不删除
   });
 }
