@@ -611,9 +611,9 @@ export async function activate(
 // ── Manager console mode ──────────────────────────────────────────────
 
 async function activateManagerConsole(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-  const gatewaySocket = process.env.CODAGENT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? "";
-  if (!gatewaySocket) {
-    console.warn("[mailbox] manager console: no CODAGENT_GATEWAY_SOCKET — status widget disabled");
+  const gatewaySocket = process.env.CODAGENT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/codeagent/gateway/control.sock`;
+  if (!existsSync(gatewaySocket)) {
+    console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
     return;
   }
   const client = new GatewayClient(gatewaySocket);
