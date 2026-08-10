@@ -38,7 +38,7 @@ export interface Config {
 }
 
 function buildConfig(sessionId: string, agentId: string): Config {
-  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/codeagent/mailbox`;
+  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/postmesh/mailbox`;
   const cli = process.env.MAILBOX_CLI ?? "mailbox";
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
@@ -611,7 +611,7 @@ export async function activate(
 // ── Manager console mode ──────────────────────────────────────────────
 
 async function activateManagerConsole(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-  const gatewaySocket = process.env.CODAGENT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/codeagent/gateway/control.sock`;
+  const gatewaySocket = process.env.CODAGENT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/postmesh/gateway/control.sock`;
   if (!existsSync(gatewaySocket)) {
     console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
     return;
