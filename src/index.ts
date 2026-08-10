@@ -12,7 +12,7 @@ const MAILBOX_MIN_VERSION = "0.1.0";
 const MAX_UI_ENTRIES = 50;
 const UI_DEBOUNCE_MS = 500;
 
-/** Launcher identity (0600 file created by codeagent, read-only here). */
+/** Launcher identity (0600 file created by postmesh, read-only here). */
 export interface GatewayIdentity {
   session_id: string;
   agent_id: string;
@@ -57,12 +57,12 @@ function versionGte(actual: string, required: string): boolean {
 
 async function checkMailboxCli(cliPath: string): Promise<void> {
   try {
-    const proc = Bun.spawn(["codeagent", "--version"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
+    const proc = Bun.spawn(["postmesh", "--version"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
     const out = await new Response(proc.stdout).text();
     const match = out.match(/(\d+\.\d+\.\d+)/);
     if (match && proc.exitCode === 0) {
       if (!versionGte(match[1], MAILBOX_MIN_VERSION)) {
-        console.error(`[mailbox] codeagent version ${match[1]} < required ${MAILBOX_MIN_VERSION}. Please upgrade codeagent.`);
+        console.error(`[mailbox] postmesh version ${match[1]} < required ${MAILBOX_MIN_VERSION}. Please upgrade postmesh.`);
         throw new Error(`mailbox CLI version too old: ${match[1]} < ${MAILBOX_MIN_VERSION}`);
       }
       return;
@@ -73,11 +73,11 @@ async function checkMailboxCli(cliPath: string): Promise<void> {
     const proc = Bun.spawn([cliPath, "--help"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
     await proc.exited;
     if (proc.exitCode !== 0) {
-      console.error(`[mailbox] CLI '${cliPath}' is not callable (exit ${proc.exitCode}). Is codeagent installed? (pipx install codeagent-py)`);
+      console.error(`[mailbox] CLI '${cliPath}' is not callable (exit ${proc.exitCode}). Is postmesh installed? (pipx install postmesh-py)`);
       throw new Error(`mailbox CLI not functional: ${cliPath}`);
     }
   } catch (e) {
-    console.error(`[mailbox] CLI '${cliPath}' not found in PATH. Set MAILBOX_CLI or install codeagent (pipx install codeagent-py).`);
+    console.error(`[mailbox] CLI '${cliPath}' not found in PATH. Set MAILBOX_CLI or install postmesh (pipx install postmesh-py).`);
     throw new Error(`mailbox CLI not found: ${cliPath}`);
   }
 }

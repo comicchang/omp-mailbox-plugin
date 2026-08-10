@@ -6,7 +6,7 @@
   "omp": {
     "extensions": ["./src/index.ts"]
   },
-  "description": "Thin OMP notification adapter for mailbox protocol (requires canonical mailbox CLI via codeagent-py)",
+  "description": "Thin OMP notification adapter for mailbox protocol (requires canonical mailbox CLI via postmesh-py)",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
