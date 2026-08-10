@@ -1,7 +1,7 @@
 # omp-mailbox-plugin
 
 OMP extension for session-based direct-inbox worker-to-worker messaging via
-[codeagent-py](https://github.com/comicchang/codeagent-py) swarm/mailbox protocol.
+[postmesh-py](https://github.com/comicchang/postmesh-py) swarm/mailbox protocol.
 No relay daemon —跨主机通信走 SSH wire protocol（Mode B Remote Transport）；
 同一主机共享 mailbox root（Mode A Shared FS）亦可。
 
@@ -10,21 +10,21 @@ No relay daemon —跨主机通信走 SSH wire protocol（Mode B Remote Transpor
 **激活**：deferred —— 读 launcher 注入的身份 env（`OMP_MAILBOX_IDENTITY_FILE`）。
 
 ```
-Worker A:  codeagent swarm direct --session <id> --from A --to B ...  → <root>/<session>/B/inbox/{msg_id}.json
+Worker A:  postmesh swarm direct --session <id> --from A --to B ...  → <root>/<session>/B/inbox/{msg_id}.json
                               ↓ (SSH wire / 本地写入)
 Worker B:  fs.watch → mailbox peek → sendMessage(triggerTurn) → read → finalize (auto-claim)
 ```
 
 ## 前置
 
-Thin notification adapter——所有 mailbox 操作委托给 codeagent-py 的 `mailbox`/`codeagent` CLI：
+Thin notification adapter——所有 mailbox 操作委托给 postmesh-py 的 `mailbox`/`postmesh` CLI：
 
 ```bash
-uv tool install git+https://github.com/comicchang/codeagent-py.git@v0.2.5
-# 安装 'codeagent' + 'mailbox' + 'codeagent-remote-exec' 等入口
+uv tool install git+https://github.com/comicchang/postmesh-py.git@v0.2.7
+# 安装 'postmesh' + 'mailbox' + 'postmesh-remote-exec' 等入口
 ```
 
-激活时做 capability check：`codeagent --version` ≥ `MAILBOX_MIN_VERSION`（0.1.0）；失败显式报错，不静默降级。
+激活时做 capability check：`postmesh --version` ≥ `MAILBOX_MIN_VERSION`（0.1.0）；失败显式报错，不静默降级。
 
 ## 安装
 
@@ -53,9 +53,9 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 
 | Env | Required | 说明 |
 |---|---|---|
-| `OMP_MAILBOX_IDENTITY_FILE` | 是（Worker） | 身份 JSON 路径 `{session_id, worker_id}`——launcher 注入（codeagent OMPRunner 写 per-run token 文件） |
+| `OMP_MAILBOX_IDENTITY_FILE` | 是（Worker） | 身份 JSON 路径 `{session_id, worker_id}`——launcher 注入（postmesh OMPRunner 写 per-run token 文件） |
 | `OMP_MAILBOX_SESSION_ID` / `OMP_MAILBOX_AGENT_ID` | 是 | 会话/agent 标识（Manager 会话无身份 → 不激活） |
-| `MAILBOX_ROOT` | 否 | mailbox root（默认 `~/.local/share/codeagent/mailbox`） |
+| `MAILBOX_ROOT` | 否 | mailbox root（默认 `~/.local/share/postmesh/mailbox`） |
 | `MAILBOX_CLI` | 否 | mailbox CLI（默认 PATH 的 `mailbox`） |
 
 无 `OMP_MAILBOX_IDENTITY_FILE` → Manager 会话，插件不激活（静默 return）。
@@ -72,7 +72,7 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 ### 唤醒的可靠 Fallback（agent 轮询）
 
 触发式唤醒（fs.watch → triggerTurn）依赖 OMP extension 正常运行；作为补充，
-**prompt 引导 agent 定期 `codeagent mailbox peek` 轮询**同样可用（不依赖唤醒通知）。
+**prompt 引导 agent 定期 `postmesh mailbox peek` 轮询**同样可用（不依赖唤醒通知）。
 
 ## 协议
 
@@ -86,7 +86,7 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 **必需字段**：session_id, from, to, subject, body, kind, msg_id, created_at。
 **Kinds**：TASK / REPORT / PROGRESS / EVIDENCE / QUESTION / RESPONSE / NOTICE。
 **两阶段消费**：`mailbox read`（inbox→processing）→ 处理 → `mailbox finalize`（→archive）；`release` 退回 inbox；`recover-stale` 恢复过期 claim（300s lease）。
-跨主机：`codeagent mailbox ... --host <alias>`；高级 IPC：`codeagent swarm ...`。
+跨主机：`postmesh mailbox ... --host <alias>`；高级 IPC：`postmesh swarm ...`。
 
 ## 诊断（加载与激活判据）
 
@@ -105,7 +105,7 @@ monkey-patch console；裸 console 走 stdout/stderr，macOS 交互 TUI 下 fd2 
 
 ## 已知问题（激活前置条件）
 
-- **launcher identity 必须非空**：`codeagent run --backend omp` 注入的 identity 若
+- **launcher identity 必须非空**：`postmesh run --backend omp` 注入的 identity 若
   `worker_id` 为空（环境无 `OMP_WORKER_ID`），插件不会 activate。已修复（缺省 "worker"）；
   调用方应显式设 `OMP_WORKER_ID` 匹配 inbox 目录。
 - **激活时序**：default export 执行 ≠ activate 完成（activate 异步 poll identity + 注册
@@ -119,7 +119,7 @@ bun run typecheck    # tsc --noEmit — 0 errors
 bun test             # wake tests（2 pass）
 ```
 
-CI（codeagent-py repo）：
+CI（postmesh-py repo）：
 
 ```bash
 ./scripts/check-plugin-types.sh              # 默认 ../omp-mailbox-plugin

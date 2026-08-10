@@ -2,7 +2,7 @@
 # omp-mailbox-plugin 独立安装脚本（不依赖 dotai）
 #
 # 适用于：其他 Agent / 没有 dotai 环境的人，在任意 macOS/Linux 主机上
-# 安装 codeagent CLI + omp-mailbox-plugin + OMP 扩展配置。
+# 安装 postmesh CLI + omp-mailbox-plugin + OMP 扩展配置。
 #
 # 用法：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/comicchang/omp-mailbox-plugin/main/scripts/install.sh)
@@ -10,12 +10,12 @@
 #   curl -fsSL .../install.sh -o install.sh && bash install.sh
 #
 # 可配置环境变量：
-#   CODEAGENT_REF=v0.2.5         codeagent 安装 ref
-#   MAILBOX_MIN_OK=1             跳过 codeagent 安装（已装则验证）
+#   POSTMESH_REF=v0.2.7         postmesh 安装 ref
+#   MAILBOX_MIN_OK=1             跳过 postmesh 安装（已装则验证）
 #   OMP_EXTENSION_SKIP=1         跳过 OMP extension 配置（仅装 CLI+plugin）
 set -euo pipefail
 
-CODEAGENT_REF="${CODEAGENT_REF:-v0.2.5}"
+POSTMESH_REF="${POSTMESH_REF:-v0.2.7}"
 REPO="https://github.com/comicchang/omp-mailbox-plugin"
 LOG_PREFIX="[omp-mailbox]"
 
@@ -35,13 +35,13 @@ say "platform: $OS $(uname -m)"
 have uv   || die "uv not found — install first: curl -LsSf https://astral.sh/uv/install.sh | sh"
 have bun  || say "warn: bun not found — plugin install will use npm fallback"
 
-# ── 2. codeagent CLI（mailbox/codeagent 入口）─────────────────────────
-if have codeagent && codeagent --version >/dev/null 2>&1; then
-  say "codeagent already installed: $(codeagent --version)"
+# ── 2. postmesh CLI（mailbox/postmesh 入口）─────────────────────────
+if have postmesh && postmesh --version >/dev/null 2>&1; then
+  say "postmesh already installed: $(postmesh --version)"
 else
-  say "installing codeagent@${CODEAGENT_REF} via uv tool install..."
-  uv tool install "git+https://github.com/comicchang/codeagent-py.git@${CODEAGENT_REF}" --force
-  have codeagent || die "codeagent install failed — add ~/.local/bin to PATH"
+  say "installing postmesh@${POSTMESH_REF} via uv tool install..."
+  uv tool install "git+https://github.com/comicchang/postmesh-py.git@${POSTMESH_REF}" --force
+  have postmesh || die "postmesh install failed — add ~/.local/bin to PATH"
 fi
 
 # ── 3. omp-mailbox-plugin ──────────────────────────────────────────────
@@ -98,7 +98,7 @@ fi
 
 # ── 5. 验证 ────────────────────────────────────────────────────────────
 say "verifying..."
-codeagent --version
+postmesh --version
 [ -e "$PLUGIN_ENTRY" ] && say "plugin entry OK: $PLUGIN_ENTRY"
 say "done. 使用：omp-mailbox（带唤醒）或 omp（无唤醒，agent 轮询）"
 say "身份注入（Worker 会话）：SWARM_SESSION_ID/OMP_WORKER_ID/OMP_MAILBOX_IDENTITY_FILE 由 launcher 提供"

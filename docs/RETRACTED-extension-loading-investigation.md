@@ -21,7 +21,7 @@ Oracle 源码级验证（`/tmp/oh-my-pi`）：
 
 ## 真正的集成问题（已修复/待跟踪）
 
-- **codeagent launcher 空 worker_id**（`runners/omp.py`）：非 manager 时 identity 的
+- **postmesh launcher 空 worker_id**（`runners/omp.py`）：非 manager 时 identity 的
   `worker_id` 曾恒空 → 插件 `readIdentityFile` 拒绝 → activate 永不进入（现场 64/64 为空）。
   **已修复**：缺省非空 `worker`；调用方应显式设 `OMP_WORKER_ID`。
 - **插件 seen-before-send**（`src/index.ts` poll）：原 `seen.add` 在 `sendMessage` 前——
