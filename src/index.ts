@@ -611,7 +611,7 @@ export async function activate(
 // ── Manager console mode ──────────────────────────────────────────────
 
 async function activateManagerConsole(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-  const gatewaySocket = process.env.CODAGENT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/postmesh/gateway/control.sock`;
+  const gatewaySocket = process.env.POSTMESH_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/postmesh/gateway/control.sock`;
   if (!existsSync(gatewaySocket)) {
     console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
     return;
