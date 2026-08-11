@@ -375,6 +375,16 @@ export async function activate(
   cfg: Config,
   identityPath: string,
 ): Promise<void> {
+  // Version/capability self-check: RuntimeEventReporter is declared in this
+  // module (always defined), so typeof is meaningless here. The real
+  // capability signal is the gateway_socket handshake — without it the
+  // gateway marks this runtime offline in ~2min.
+  const identity = readIdentityFile(identityPath);
+  const HAS_REPORTER = Boolean(identity?.gateway_socket);
+  if (!HAS_REPORTER) {
+    console.error("[omp-mailbox-plugin] WARNING: running old version without RuntimeEventReporter — gateway will mark this runtime offline in ~2min. Reinstall from github:comicchang/omp-mailbox-plugin@main");
+  }
+
   await checkMailboxCli(cfg.cliPath);
 
   let watcherAc: AbortController | null = null;
@@ -384,7 +394,6 @@ export async function activate(
   const RETRY_MS = 60_000;
 
   // ── Gateway handshake (best-effort) ────────────────────────────────
-  const identity = readIdentityFile(identityPath);
   let reporter: RuntimeEventReporter | null = null;
   let initialTask = "";
     if (identity) {
