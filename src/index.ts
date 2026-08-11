@@ -21,6 +21,10 @@ const DEDUP_SAVE_DEBOUNCE_MS = 500;
 // P3-19c: when comparing a live pid's process start time against the
 // identity file mtime, allow clock/fs rounding slack (5s).
 const PID_START_TOLERANCE_MS = 5_000;
+// R4: cached backend session id — captured once at session_start (where the
+// real ExtensionContext/sessionManager is available), reused by heartbeat
+// restore re-register (where only the outer empty ctx is in scope).
+let capturedBackendSessionId = "";
 // P3-19d: sweep stale launcher identity files every 10 min (one-shot sweep
 // also runs at activation) so ~/.omp/mailbox-identity stops accumulating.
 const IDENTITY_CLEANUP_MS = 10 * 60_000;
@@ -681,12 +685,15 @@ export async function activate(
   // session_start: the real OMP session id becomes available only after the
   // session initializes — re-register with backend_session_id so the gateway
   // can sync it into the park manifest (warm resume across gateway restarts).
-  on("session_start", () => {
+  // 注意：必须用 handler 的 ctx 参数（session_start 事件的 ExtensionContext），
+  // 而非 activate 的外层 ctx（可能是空对象 fallback，getSessionId 恒空）。
+  on("session_start", ((_evt: unknown, handlerCtx: ExtensionContext) => {
     if (!identity?.gateway_socket) return;
     let backendSessionId = "";
     try {
-      backendSessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+      backendSessionId = handlerCtx?.sessionManager?.getSessionId?.() ?? "";
     } catch { /* not ready yet */ }
+    if (backendSessionId) capturedBackendSessionId = backendSessionId; // R4: 缓存供 heartbeat 恢复复用
     if (!backendSessionId) return;
     new GatewayClient(identity.gateway_socket).call("runtime.register", {
       session_id: identity.session_id,
@@ -701,7 +708,7 @@ export async function activate(
     }).catch((e) => {
       console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
     });
-  });
+  }) as never);
   on("turn_start", () => {
     if (reporter) {
       reporter.report("TURN_STARTED", {});
@@ -920,7 +927,7 @@ export async function activate(
             runtime_id: identity.runtime_id,
             review_key: identity.review_key,
             generation: identity.generation,
-            backend_session_id: ctx?.sessionManager?.getSessionId?.() ?? "",
+            backend_session_id: capturedBackendSessionId || ctx?.sessionManager?.getSessionId?.() || "",
             runtime: "omp",
             owner_pid: identity.owner_pid,
             nonce: identity.nonce,
