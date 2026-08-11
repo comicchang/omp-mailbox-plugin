@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { readFileSync, existsSync, unlinkSync, writeFileSync, watch as fsWatch } from "node:fs";
+import { readFileSync, existsSync, unlinkSync, writeFileSync, watch as fsWatch, mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 const POLL_MS = 30_000;
 const IDENTITY_POLL_MS = 2_000;
@@ -12,6 +13,17 @@ const MAILBOX_MIN_VERSION = "0.1.0";
 const MAX_UI_ENTRIES = 50;
 const UI_DEBOUNCE_MS = 500;
 const RETRY_NOTIFY_MS = 300_000; // A11.3: re-push interval for unclaimed messages (was 60s)
+// P3-19b: dedup state is persisted so a crashed/restarted runtime never
+// re-pushes (with triggerTurn) messages already notified, nor re-notifies
+// consumed ones. Saved debounced + on shutdown.
+const DEDUP_STATE_FILE = ".mailbox-dedup.json";
+const DEDUP_SAVE_DEBOUNCE_MS = 500;
+// P3-19c: when comparing a live pid's process start time against the
+// identity file mtime, allow clock/fs rounding slack (5s).
+const PID_START_TOLERANCE_MS = 5_000;
+// P3-19d: sweep stale launcher identity files every 10 min (one-shot sweep
+// also runs at activation) so ~/.omp/mailbox-identity stops accumulating.
+const IDENTITY_CLEANUP_MS = 10 * 60_000;
 
 /** Launcher identity (0600 file created by postmesh, read-only here). */
 export interface GatewayIdentity {
@@ -162,6 +174,44 @@ export class GatewayClient {
 
 // ── Identity ───────────────────────────────────────────────────────────
 
+// P3-19c: process start time (epoch ms) of a live pid, or null if
+// unavailable. Used to detect PID reuse: a pid whose process started AFTER
+// the identity file was written cannot be the original launcher.
+function processStartTimeMs(pid: number): number | null {
+  try {
+    if (process.platform === "darwin") {
+      // Elapsed time is timezone-independent ("[[DD-]HH:]MM:SS"); deriving
+      // start = now - elapsed avoids Date.parse TZ pitfalls (bun test runs
+      // with TZ=UTC while ps reports system-local start time).
+      const out = Bun.spawnSync(["ps", "-o", "etime=", "-p", String(pid)], {
+        stdout: "pipe", stderr: "pipe",
+      });
+      const s = out.stdout.toString().trim();
+      if (!s) return null;
+      const m = s.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+      if (!m) return null;
+      const dd = Number(m[1] ?? 0), hh = Number(m[2] ?? 0), mm = Number(m[3]), ss = Number(m[4]);
+      if (![dd, hh, mm, ss].every(Number.isFinite)) return null;
+      return Date.now() - ((dd * 86400 + hh * 3600 + mm * 60 + ss) * 1000);
+    }
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+      // comm (field 2) may contain spaces/parens — split after the last ')'.
+      const close = stat.lastIndexOf(")");
+      const fields = stat.slice(close + 2).split(" ");
+      const startTicks = Number(fields[19]); // field 22 overall, 0-based after 3
+      if (!Number.isFinite(startTicks)) return null;
+      let btime = 0;
+      for (const line of readFileSync("/proc/stat", "utf-8").split("\n")) {
+        if (line.startsWith("btime ")) { btime = Number(line.slice(6)); break; }
+      }
+      // starttime is in clock ticks since boot; USER_HZ is 100 on Linux.
+      return (btime + startTicks / 100) * 1000;
+    }
+  } catch { /* pid gone or procfs unavailable */ }
+  return null;
+}
+
 export function readIdentityFile(path: string): GatewayIdentity | null {
   try {
     if (!existsSync(path)) return null;
@@ -173,6 +223,19 @@ export function readIdentityFile(path: string): GatewayIdentity | null {
         process.kill(ownerPid, 0); // signal 0 = existence check
       } catch {
         return null; // PID no longer alive — stale identity
+      }
+      // P3-19c: an alive pid may have been recycled by an unrelated process
+      // (the original launcher died, kernel reused the number). The launcher
+      // wrote this file from its own process, so its start time is at or
+      // before the file mtime; a start time after mtime ⇒ PID reuse.
+      const startMs = processStartTimeMs(ownerPid);
+      if (startMs !== null) {
+        let mtimeMs = 0;
+        try { mtimeMs = statSync(path).mtimeMs; } catch { /* unreadable — fall through */ }
+        if (mtimeMs > 0 && startMs > mtimeMs + PID_START_TOLERANCE_MS) {
+          console.warn(`[mailbox] identity ${path}: owner_pid ${ownerPid} reused by a newer process — rejecting stale identity`);
+          return null;
+        }
       }
     }
 
@@ -196,6 +259,79 @@ export function readIdentityFile(path: string): GatewayIdentity | null {
       nonce: data.nonce ?? "",
     };
   } catch { return null; }
+}
+
+// P3-19d: sweep stale launcher identity files (dead/missing owner_pid or
+// unreadable/corrupt) so ~/.omp/mailbox-identity does not accumulate
+// hundreds of leftovers across launcher runs. The plugin's own identity
+// file is never removed; files whose owner is alive are kept (another
+// runtime may still be reading them).
+function cleanupIdentityDir(identityDir: string, ownPath: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(identityDir);
+  } catch { return; } // dir missing — nothing to clean
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const p = join(identityDir, name);
+    if (p === ownPath) continue;
+    let stale = false;
+    try {
+      const data = JSON.parse(readFileSync(p, "utf-8")) as { owner_pid?: unknown };
+      const pid = typeof data.owner_pid === "number" ? data.owner_pid : 0;
+      if (!pid) {
+        stale = true; // no owner info — cannot be a live launcher identity
+      } else {
+        try { process.kill(pid, 0); } catch { stale = true; }
+      }
+    } catch { stale = true; } // corrupt/unreadable → stale
+    if (stale) {
+      try { unlinkSync(p); } catch { /* raced with another sweep — ignore */ }
+    }
+  }
+}
+
+// ── Dedup state persistence (P3-19b) ──────────────────────────────────
+
+interface DedupState {
+  seen: string[];
+  notifiedAt: Record<string, number>; // msg_id → last notified epoch ms
+  savedAt: number;
+}
+
+function dedupStatePath(cfg: Config): string {
+  return `${cfg.mailboxRoot}/${cfg.sessionId}/${cfg.agentId}/${DEDUP_STATE_FILE}`;
+}
+
+/** Load persisted dedup state; returns empty sets when absent/corrupt. */
+function loadDedupState(cfg: Config): { seen: Set<string>; notifiedAt: Map<string, number> } {
+  const seen = new Set<string>();
+  const notifiedAt = new Map<string, number>();
+  try {
+    const state = JSON.parse(readFileSync(dedupStatePath(cfg), "utf-8")) as Partial<DedupState>;
+    if (Array.isArray(state.seen)) for (const id of state.seen) if (typeof id === "string") seen.add(id);
+    if (state.notifiedAt && typeof state.notifiedAt === "object") {
+      for (const [id, ts] of Object.entries(state.notifiedAt)) {
+        if (typeof ts === "number") notifiedAt.set(id, ts);
+      }
+    }
+  } catch { /* no state yet — fresh start */ }
+  // Bound restored state to the same caps the runtime enforces in memory.
+  while (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+  while (notifiedAt.size > MAX_DEDUP_IDS) notifiedAt.delete(notifiedAt.keys().next().value!);
+  return { seen, notifiedAt };
+}
+
+/** Persist dedup state (tmp + rename so a crash mid-write cannot corrupt). */
+function persistDedupState(cfg: Config, seen: Set<string>, notifiedAt: Map<string, number>): void {
+  try {
+    const dir = `${cfg.mailboxRoot}/${cfg.sessionId}/${cfg.agentId}`;
+    mkdirSync(dir, { recursive: true });
+    const target = dedupStatePath(cfg);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ seen: [...seen], notifiedAt: Object.fromEntries(notifiedAt), savedAt: Date.now() } satisfies DedupState));
+    try { renameSync(tmp, target); } catch { unlinkSync(tmp); /* retried on next change */ }
+  } catch { /* state dir unwritable — dedup degrades to in-memory only */ }
 }
 
 async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
@@ -305,9 +441,8 @@ export class RuntimeEventReporter {
     this.ctx = ctx;
   }
 
-  report(kind: string, payload: Record<string, unknown>): void {
-    if (!this.client) return;
-    const evt = {
+  private buildEvent(kind: string, payload: Record<string, unknown>): Record<string, unknown> {
+    return {
       runtime_id: this.identity.runtime_id,
       generation: this.identity.generation,
       session_id: this.identity.session_id,
@@ -318,9 +453,32 @@ export class RuntimeEventReporter {
       created_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
       payload,
     };
-    this.client.call("runtime.event", { event: evt }).catch((e) => {
+  }
+
+  /** Fire-and-forget report — logs failures, resolves regardless. */
+  report(kind: string, payload: Record<string, unknown>): Promise<void> {
+    if (!this.client) return Promise.resolve();
+    return this.client.call("runtime.event", { event: this.buildEvent(kind, payload) }).then(() => undefined).catch((e) => {
       console.error(`[mailbox] runtime.event failed: ${(e as Error).message}`);
     });
+  }
+
+  /**
+   * P3-19a: retrying report for terminal state events (e.g. TASK_STATE
+   * agent_end) that must not be silently dropped when the gateway is
+   * briefly unreachable — the gateway relies on them for run accounting.
+   * Unlike report(), each attempt is awaited/re-scheduled on failure
+   * (exponential backoff: baseDelayMs, 2x, 4x, …).
+   */
+  reportRetry(kind: string, payload: Record<string, unknown>, attempts = 3, baseDelayMs = 500): void {
+    if (!this.client) return;
+    const attempt = (n: number): void => {
+      this.client!.call("runtime.event", { event: this.buildEvent(kind, payload) }).catch((e) => {
+        console.error(`[mailbox] runtime.event ${kind} attempt ${n}/${attempts} failed: ${(e as Error).message}`);
+        if (n < attempts) setTimeout(() => attempt(n + 1), baseDelayMs * 2 ** (n - 1));
+      });
+    };
+    attempt(1);
   }
 
   /**
@@ -409,12 +567,32 @@ export async function activate(
     console.error("[omp-mailbox-plugin] WARNING: running old version without RuntimeEventReporter — gateway will mark this runtime offline in ~2min. Reinstall from github:comicchang/omp-mailbox-plugin@main");
   }
 
-  await checkMailboxCli(cfg.cliPath);
+  // P1-11: checkMailboxCli 失败单独标记不阻断 activate 重试。
+  // CLI 暂不可用时（如升级中、PATH 未就绪）不应阻止整个插件激活。
+  let cliOk = true;
+  try {
+    await checkMailboxCli(cfg.cliPath);
+  } catch (e: unknown) {
+    cliOk = false;
+    console.warn("[mailbox] checkMailboxCli failed (non-fatal, activate continues):", e);
+  }
 
   let watcherAc: AbortController | null = null;
   let polling = false;
-  const seen = new Set<string>();
-  const notifiedAt = new Map<string, number>(); // A11.3: per-msg_id last notification timestamp
+  // P3-19b: dedup state persisted across restarts (see loadDedupState) —
+  // a crashed runtime must not re-push+triggerTurn messages already
+  // notified, nor re-notify consumed ones.
+  const { seen, notifiedAt } = loadDedupState(cfg);
+  // P3-19b: debounced save whenever seen/notifiedAt change; flushed
+  // synchronously on session_shutdown so the latest state survives crashes.
+  let dedupSaveTimer: Timer | undefined;
+  const scheduleDedupSave = (): void => {
+    clearTimeout(dedupSaveTimer);
+    dedupSaveTimer = setTimeout(() => {
+      dedupSaveTimer = undefined;
+      persistDedupState(cfg, seen, notifiedAt);
+    }, DEDUP_SAVE_DEBOUNCE_MS);
+  };
 
   // ── Gateway handshake (best-effort) ────────────────────────────────
   let reporter: RuntimeEventReporter | null = null;
@@ -552,7 +730,10 @@ export async function activate(
   on("agent_end", () => {
     if (reporter) {
       reporter.setStatus("agent-ended");
-      reporter.report("TASK_STATE", { state: "agent_end" });
+      // P3-19a: TASK_STATE agent_end is terminal — retry delivery (3x,
+      // 500ms/1s/2s backoff) instead of fire-and-forget so the gateway
+      // reliably records run completion even if it is briefly unreachable.
+      reporter.reportRetry("TASK_STATE", { state: "agent_end" });
       reporter.updateUi("agent ended");
     }
   });
@@ -608,6 +789,7 @@ export async function activate(
           seen.add(msgId);
           notifiedAt.delete(msgId);
           if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+          scheduleDedupSave(); // P3-19b
         }
       }
       if (result.messages.length === 0) return;
@@ -659,6 +841,7 @@ export async function activate(
               pi.sendUserMessage(body || msg.subject || msg.kind);
               seen.add(msg.msg_id);
               if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+              scheduleDedupSave(); // P3-19b
               if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)}`);
             } catch (e) {
               console.error("[mailbox] claim fallback failed, retrying later:", e);
@@ -676,6 +859,7 @@ export async function activate(
           );
           notifiedAt.set(msg.msg_id, Date.now());
           if (notifiedAt.size > MAX_DEDUP_IDS) notifiedAt.delete(notifiedAt.keys().next().value!);
+          scheduleDedupSave(); // P3-19b
         } catch (e: unknown) {
           console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
           continue;
@@ -686,6 +870,15 @@ export async function activate(
 
   watcherAc = setupWatcher(cfg.inboxDir, poll);
   const interval = setInterval(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
+
+  // P3-19d: sweep stale launcher identity files once at activation, then
+  // periodically — otherwise ~/.omp/mailbox-identity accumulates leftovers
+  // from every launcher run (observed 200+ files).
+  const identityDir = dirname(identityPath);
+  cleanupIdentityDir(identityDir, identityPath);
+  const cleanupInterval = setInterval(() => {
+    cleanupIdentityDir(identityDir, identityPath);
+  }, IDENTITY_CLEANUP_MS);
 
   // ── Heartbeat: keeps the gateway's last_activity fresh (hot liveness +
   //    park lease renew). The gateway treats any runtime.event as activity;
@@ -750,6 +943,11 @@ export async function activate(
     if (watcherAc) watcherAc.abort();
     clearInterval(interval);
     clearInterval(heartbeat);
+    clearInterval(cleanupInterval);
+    // P3-19b: flush the latest dedup state (and any pending debounced save)
+    // so a restart never re-pushes messages already handled.
+    clearTimeout(dedupSaveTimer);
+    persistDedupState(cfg, seen, notifiedAt);
   });
 
   poll();
@@ -836,8 +1034,26 @@ export default function (pi: ExtensionAPI): void {
     // ctx 未捕获（session_start 未触发）时传空对象——RuntimeEventReporter
     // 会降级为纯 gateway 事件上报（无 UI）。
     const effectiveCtx = (capturedCtx ?? {}) as ExtensionContext;
-    activate(pi, effectiveCtx, cfg, identityPath).catch((e: unknown) => {
-      console.error("[mailbox] activation failed:", e);
+    // P1-11: activate 失败不清 interval，改为指数退避重试（5s→60s）。
+    // checkMailboxCli 失败单独标记不阻断重试（见 activate 内部）。
+    // P1-11: 退避重试定时器
+    let retryTimer: Timer | null = null;
+    let retryDelay = 5000; // P1-11: 初始退避 5s
+    const RETRY_MAX_DELAY = 60_000; // P1-11: 最大退避 60s
+    function tryActivate(): void {
+      // identityPath! — isWorker guard (line above) already ensured non-undefined
+      activate(pi, effectiveCtx, cfg, identityPath!).catch((e: unknown) => {
+        console.error("[mailbox] activation failed, retrying in", retryDelay / 1000, "s:", e);
+        retryTimer = setTimeout(() => {
+          retryDelay = Math.min(retryDelay * 2, RETRY_MAX_DELAY);
+          tryActivate();
+        }, retryDelay);
+      });
+    }
+    tryActivate();
+    // session_shutdown 时清理重试定时器
+    pi.on("session_shutdown", () => {
+      if (retryTimer) clearTimeout(retryTimer);
     });
   }, IDENTITY_POLL_MS);
 

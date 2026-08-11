@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,11 +7,17 @@ import {
   activate,
   GatewayClient,
   readIdentityFile,
+  RuntimeEventReporter,
   type Config,
   type GatewayIdentity,
 } from "../src/index";
 import pluginFactory from "../src/index";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+
+/** Kind of a gateway event record (validated narrowing, no unchecked cast). */
+function eventKind(e: Record<string, unknown>): string {
+  return typeof e.kind === "string" ? e.kind : "";
+}
 
 // ── Fake gateway: a UDS server that answers like the real AgentGateway ─
 
@@ -168,6 +174,22 @@ describe("gateway identity (owner/nonce/generation)", () => {
     expect(readIdentityFile(identityPath)).toBeNull();
   });
 
+  test("rejects owner_pid recycled by a newer process", async () => {
+    // P3-19c: a live pid whose process started AFTER the identity file was
+    // written cannot be the original launcher (kernel recycled the number).
+    const child = Bun.spawn(["sleep", "5"], { stdout: "pipe", stderr: "pipe" });
+    try {
+      writeFileSync(identityPath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: child.pid, nonce: "n" }));
+      // Backdate the identity file to before the child started.
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(identityPath, past, past);
+      expect(readIdentityFile(identityPath)).toBeNull();
+    } finally {
+      child.kill();
+      try { await child.exited; } catch { /* already dead */ }
+    }
+  });
+
   test("rejects nonce mismatch", () => {
     writeIdentity(identityPath, { session_id: "s1", agent_id: "w1", nonce: "expected-nonce" });
     const old = process.env.OMP_MAILBOX_NONCE;
@@ -226,6 +248,33 @@ describe("gateway client RPC", () => {
   test("gateway down → rejected promise", async () => {
     const client = new GatewayClient(join(ROOT, "missing.sock"));
     await expect(client.call("capabilities.get")).rejects.toThrow();
+  });
+
+  test("reportRetry keeps retrying until the gateway accepts (agent_end not dropped)", async () => {
+    // P3-19a: terminal reports must survive a briefly-unreachable gateway.
+    // The socket does not exist yet → first attempt fails; the backoff
+    // retry delivers once the gateway comes up, exactly once.
+    // NOTE: real delays are deliberate here — the retry is driven by the
+    // plugin's own setTimeout backoff against a real UDS socket; fake
+    // timers cannot make ECONNREFUSED happen on demand.
+    const lateSock = join(ROOT, "late.sock");
+    const identity: GatewayIdentity = {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", review_key: "",
+      generation: 1, gateway_socket: lateSock, owner_pid: process.pid, nonce: "n",
+    };
+    const reporter = new RuntimeEventReporter(identity, mockCtx());
+    reporter.reportRetry("TASK_STATE", { state: "agent_end" }, 5, 50);
+    await Bun.sleep(30); // let the immediate first attempt fail (ECONNREFUSED)
+
+    const lateFake = new FakeGateway(lateSock);
+    await lateFake.listen();
+    try {
+      await until(() => lateFake.events.some((e) => eventKind(e) === "TASK_STATE"));
+      const delivered = lateFake.events.filter((e) => eventKind(e) === "TASK_STATE");
+      expect(delivered.length).toBe(1); // retry stops after success — no duplicates
+    } finally {
+      await lateFake.close();
+    }
   });
 });
 
@@ -357,6 +406,97 @@ describe("plugin runtime adapter", () => {
     await activate(pi, mockCtx({ hasUI: false }), cfg(ROOT, "s1", "w1"), identityPath);
     await until(() => fake.requests.some((r) => r.method === "runtime.register"));
     expect(fake.requests.length).toBeGreaterThan(0);
+  });
+
+  test("agent_end emits TASK_STATE agent_end via retrying report", async () => {
+    // P3-19a: the terminal agent_end event must be delivered (retrying
+    // report) and carry the correct state for gateway run accounting.
+    writeIdentity(identityPath, {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
+    });
+    const handlers = new Map<string, () => void>();
+    const pi = {
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      on: (evt: string, fn: () => void) => handlers.set(evt, fn),
+    } as unknown as ExtensionAPI;
+    await activate(pi, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    await until(() => fake.requests.some((r) => r.method === "runtime.register"));
+
+    handlers.get("agent_end")?.();
+    await until(() => fake.events.some((e) => eventKind(e) === "TASK_STATE"));
+    const evt = fake.events.find((e) => eventKind(e) === "TASK_STATE")!;
+    expect(evt.payload).toEqual({ state: "agent_end" });
+  });
+
+  test("persisted dedup: restart does not re-push or re-trigger known messages", async () => {
+    // P3-19b: dedup state survives a runtime restart (crash) — a message
+    // already notified/consumed is never pushed again with triggerTurn.
+    writeIdentity(identityPath, {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
+    });
+    const mkPi = (out: SentMessage[]) => {
+      const handlers = new Map<string, () => void>();
+      const pi = {
+        sendMessage: (msg: unknown, o: unknown) => {
+          const content = (msg as { content: string }).content;
+          const opts = (o ?? {}) as { triggerTurn: boolean; deliverAs?: string };
+          out.push({ content, opts });
+        },
+        sendUserMessage: () => {},
+        on: (evt: string, fn: () => void) => handlers.set(evt, fn),
+      } as unknown as ExtensionAPI;
+      return { pi, handlers };
+    };
+
+    const msg = {
+      session_id: "s1", from: "manager", to: "w1", subject: "persist-me",
+      body: "b", kind: "TASK", msg_id: "mgr_persist_1", created_at: "2026-01-01T00:00:00Z",
+    };
+    const p = join(inbox, "mgr_persist_1.json");
+
+    // runtime 1: notify the message (triggerTurn), then shutdown → flush state.
+    const first: SentMessage[] = [];
+    const r1 = mkPi(first);
+    await activate(r1.pi, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    await until(() => fake.requests.some((r) => r.method === "runtime.register"));
+    writeFileSync(p, JSON.stringify(msg));
+    await until(() => first.length === 1);
+    expect(first[0].opts.triggerTurn).toBe(true);
+    r1.handlers.get("session_shutdown")?.();
+
+    // runtime 2 (fresh in-memory dedup) on the same mailbox — msg still in
+    // the inbox, but the persisted state must suppress any re-push.
+    const second: SentMessage[] = [];
+    const r2 = mkPi(second);
+    await activate(r2.pi, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    await Bun.sleep(300); // allow the activation poll to observe the inbox
+    expect(second.length).toBe(0);
+
+    // A genuinely new message still wakes the agent with triggerTurn.
+    writeFileSync(join(inbox, "mgr_persist_2.json"), JSON.stringify({ ...msg, subject: "new", msg_id: "mgr_persist_2" }));
+    await until(() => second.length === 1);
+    expect(second[0].opts.triggerTurn).toBe(true);
+    r2.handlers.get("session_shutdown")?.();
+  });
+
+  test("stale launcher identity files are swept; own + live-owner kept", async () => {
+    // P3-19d: ~/.omp/mailbox-identity accumulation is bounded — dead-owner
+    // leftovers are removed at activation, the plugin's own identity file
+    // and any file whose launcher is still alive are preserved.
+    const identityDir = join(ROOT, "identities");
+    mkdirSync(identityDir, { recursive: true });
+    const ownPath = join(identityDir, "own.json");
+    const stalePath = join(identityDir, "stale.json");
+    const livePath = join(identityDir, "live.json");
+    writeFileSync(ownPath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: process.pid }));
+    writeFileSync(stalePath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: 99999999 }));
+    writeFileSync(livePath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: process.pid }));
+
+    await activate(mockPi(messages) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), ownPath);
+    await until(() => !existsSync(stalePath));
+    expect(existsSync(ownPath)).toBe(true);
+    expect(existsSync(livePath)).toBe(true);
   });
 });
 
