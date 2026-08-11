@@ -11,6 +11,7 @@ const MAX_DEDUP_IDS = 100;
 const MAILBOX_MIN_VERSION = "0.1.0";
 const MAX_UI_ENTRIES = 50;
 const UI_DEBOUNCE_MS = 500;
+const RETRY_NOTIFY_MS = 300_000; // A11.3: re-push interval for unclaimed messages (was 60s)
 
 /** Launcher identity (0600 file created by postmesh, read-only here). */
 export interface GatewayIdentity {
@@ -41,6 +42,14 @@ function buildConfig(sessionId: string, agentId: string): Config {
   const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/postmesh/mailbox`;
   const cli = process.env.MAILBOX_CLI ?? "mailbox";
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
+}
+
+// A11.1: truncate a UTF-8 body to a 2KB byte budget without splitting
+// multi-byte chars (char-slicing would let a CJK body exceed the budget).
+function truncateUtf8(s: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length <= maxBytes) return s;
+  return new TextDecoder("utf-8").decode(bytes.subarray(0, maxBytes));
 }
 
 function versionGte(actual: string, required: string): boolean {
@@ -365,6 +374,21 @@ export class RuntimeEventReporter {
   toolCount(): number {
     return this.state?.toolCount ?? 0;
   }
+
+  // A13: refresh widget tool stats from gateway-aggregated EventStore
+  // (source of truth). In-process counter (bumpTools) provides immediate
+  // feedback; this reconciles periodically via runtime.info.
+  async refreshToolStats(): Promise<void> {
+    if (!this.client || !this.state) return;
+    try {
+      const info = await this.client.call("runtime.info", { runtime_id: this.identity.runtime_id });
+      const stats = (info.tool_stats ?? {}) as { tool_count?: unknown; error_count?: unknown };
+      if (typeof stats.tool_count === "number") {
+        this.state.toolCount = stats.tool_count;
+        renderUi(this.ctx!, this.state);
+      }
+    } catch { /* gateway may not support runtime.info — keep in-process count */ }
+  }
 }
 
 // ── runtime adapter activation (worker/oracle) ────────────────────────
@@ -390,8 +414,7 @@ export async function activate(
   let watcherAc: AbortController | null = null;
   let polling = false;
   const seen = new Set<string>();
-  const sentAt = new Map<string, number>();
-  const RETRY_MS = 60_000;
+  const notifiedAt = new Map<string, number>(); // A11.3: per-msg_id last notification timestamp
 
   // ── Gateway handshake (best-effort) ────────────────────────────────
   let reporter: RuntimeEventReporter | null = null;
@@ -540,16 +563,29 @@ export async function activate(
 
   // ── Watcher: peek + notify only (never consumes; receipts come from
   //    the tool's gateway read). ──────────────────────────────────────
-  function scheduleSeenAfterConsumed(msgId: string): void {
-    setTimeout(() => {
-      runPeek(cfg).then((r) => {
-        const stillPending = r?.messages.some((m) => m.msg_id === msgId) ?? false;
-        if (!stillPending) {
-          seen.add(msgId);
-          if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
-        }
-      }).catch(() => { /* keep un-seen; retry next poll */ });
-    }, CHECK_TIMEOUT_MS);
+  /** Read the pending message body from its inbox file (peek summary has no body). */
+  function readBodySnippet(msgId: string): string {
+    try {
+      const raw = readFileSync(`${cfg.inboxDir}/${msgId}.json`, "utf-8");
+      const parsed = JSON.parse(raw) as { body?: unknown };
+      if (typeof parsed.body === "string") return truncateUtf8(parsed.body, 2048);
+    } catch { /* body not yet durable / unreadable */ }
+    return "";
+  }
+
+  // A11.4: detect whether the agent can claim messages on its own.
+  // If getActiveTools is unavailable (old runtime, test mock) → assume
+  // the agent can claim → keep notify-only behaviour (safe fallback).
+  function agentHasClaimTool(piApi: ExtensionAPI): boolean {
+    try {
+      const tools = typeof piApi.getActiveTools === "function" ? piApi.getActiveTools() : null;
+      if (!tools) return true;
+      if (tools.includes("bash")) return true; // can claim via `mailbox read` CLI
+      // A11.4: bare "read" is the generic file-read tool (present on every
+      // agent) — matching it would false-positive and defeat the degradation
+      // for restricted-tool oracles. Match claim-capable names only.
+      return tools.some((t) => /(mailbox|inbox|claim)/i.test(t));
+    } catch { return true; }
   }
 
   async function poll(): Promise<void> {
@@ -559,11 +595,24 @@ export async function activate(
       const result = await runPeek(cfg);
       if (reporter) reporter.setPending(result?.pending ?? 0);
       if (reporter) renderUi(ctx, reporter.snapshot());
-      if (!result || result.messages.length === 0) return;
+      if (!result) return;
+      // A11.2: consumed messages → seen.add immediately (no 5s delay).
+      // Messages no longer in peek (pending=0) have been claimed/finalized.
+      // Runs before the empty-check so bookkeeping keeps up even when the
+      // inbox just drained to zero.
+      for (const [msgId] of notifiedAt) {
+        if (!result.messages.some((m) => m.msg_id === msgId)) {
+          seen.add(msgId);
+          notifiedAt.delete(msgId);
+          if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+        }
+      }
+      if (result.messages.length === 0) return;
       for (const msg of result.messages) {
         if (seen.has(msg.msg_id)) continue;
-        const lastSent = sentAt.get(msg.msg_id);
-        if (lastSent !== undefined && Date.now() - lastSent < RETRY_MS) continue;
+        const firstPush = !notifiedAt.has(msg.msg_id); // A11.3
+        // A11.3: second+ push waits RETRY_NOTIFY_MS (was 60s, now 300s)
+        if (!firstPush && Date.now() - notifiedAt.get(msg.msg_id)! < RETRY_NOTIFY_MS) continue;
         try {
           // Delivery mode: in-loop messages use "steer" while the agent is
           // running; idle / turn wrap-up uses "nextTurn" (hidden from the
@@ -574,22 +623,56 @@ export async function activate(
           try {
             if (typeof ctx?.isIdle === "function" && !ctx.isIdle()) deliverAs = "steer";
           } catch { /* fall through to nextTurn */ }
+          // A11.1: include the message body so the notification is actionable
+          // even without the claim tool.
+          const body = readBodySnippet(msg.msg_id);
+          const bodyBlock = body ? `\n${body}\n` : "";
+
+          // A11.4: claim degradation — when the agent has no claim tool
+          // (e.g. oracle with restricted tools), auto read+finalize the
+          // message and direct-deliver its body as a user turn.
+          if (identity?.gateway_socket && !agentHasClaimTool(pi) && msg.kind === "TASK") {
+            try {
+              const claimClient = new GatewayClient(identity.gateway_socket);
+              const read = await claimClient.call("message.read", {
+                session_id: cfg.sessionId,
+                agent: cfg.agentId,
+                owner: cfg.agentId,
+              });
+              const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? msg.msg_id;
+              if (claimedId) {
+                await claimClient.call("message.finalize", {
+                  session_id: cfg.sessionId,
+                  agent: cfg.agentId,
+                  msg_id: claimedId,
+                  owner: cfg.agentId,
+                });
+              }
+              // A11.4: direct delivery as a real user turn
+              pi.sendUserMessage(body || msg.subject || msg.kind);
+              seen.add(msg.msg_id);
+              if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+              if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)}`);
+            } catch (e) {
+              console.error("[mailbox] claim fallback failed, retrying later:", e);
+              continue;
+            }
+            continue;
+          }
+
+          // Normal notify path (agent has claim tool or not a TASK).
           pi.sendMessage(
             { customType: "omp-mailbox", display: true,
-              content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}\n\n> claim with /agent-inbox read`,
-              details: { from: msg.from, kind: msg.kind } },
-            { triggerTurn: true, deliverAs },
+              content: `📬 MAILBOX: ${result.pending} pending\nFrom: ${msg.from}  Kind: ${msg.kind}\nSubject: ${msg.subject}${bodyBlock}\n> 消息正文已附上；领取请用 /agent-inbox read（未领取将低频重推）`,
+              details: { from: msg.from, kind: msg.kind, subject: msg.subject, body } },
+            { triggerTurn: firstPush, deliverAs }, // A11.3: triggerTurn only on first push
           );
-          sentAt.set(msg.msg_id, Date.now());
-          if (sentAt.size > MAX_DEDUP_IDS) {
-            const oldest = sentAt.keys().next().value!;
-            sentAt.delete(oldest);
-          }
+          notifiedAt.set(msg.msg_id, Date.now());
+          if (notifiedAt.size > MAX_DEDUP_IDS) notifiedAt.delete(notifiedAt.keys().next().value!);
         } catch (e: unknown) {
           console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
           continue;
         }
-        scheduleSeenAfterConsumed(msg.msg_id);
       }
     } catch (e: unknown) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
@@ -606,6 +689,9 @@ export async function activate(
     new GatewayClient(identity.gateway_socket).call("runtime.heartbeat", {
       runtime_id: identity.runtime_id,
     }).catch(() => { /* gateway down — retry next tick */ });
+    // A13: reconcile widget tool counter with gateway-aggregated tool_stats
+    // (bumpTools provides immediate feedback; this is the source-of-truth refresh)
+    reporter?.refreshToolStats().catch(() => {});
   }, HEARTBEAT_MS);
 
   pi.on("session_shutdown", () => {
