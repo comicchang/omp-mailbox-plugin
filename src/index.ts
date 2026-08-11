@@ -465,10 +465,13 @@ export async function activate(
         if (identity.gateway_socket && initialTaskMsgId) {
             try {
                 const client = new GatewayClient(identity.gateway_socket);
+                // P1-8: pass known initialTaskMsgId to claim the exact
+                // message, not the oldest unclaimed.
                 const read = await client.call("message.read", {
                     session_id: identity.session_id,
                     agent: identity.agent_id,
                     owner: identity.agent_id,
+                    msg_id: initialTaskMsgId,
                 });
                 const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? "";
                 if (claimedId) {
@@ -634,10 +637,14 @@ export async function activate(
           if (identity?.gateway_socket && !agentHasClaimTool(pi) && msg.kind === "TASK") {
             try {
               const claimClient = new GatewayClient(identity.gateway_socket);
+              // P1-8: pass msg_id to claim the exact notified message,
+              // not the oldest unclaimed — prevents claim-drift when
+              // multiple messages are pending.
               const read = await claimClient.call("message.read", {
                 session_id: cfg.sessionId,
                 agent: cfg.agentId,
                 owner: cfg.agentId,
+                msg_id: msg.msg_id,
               });
               const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? msg.msg_id;
               if (claimedId) {
@@ -684,11 +691,56 @@ export async function activate(
   //    park lease renew). The gateway treats any runtime.event as activity;
   //    the heartbeat guarantees a cadence even when idle. ────────────
   const HEARTBEAT_MS = 60_000;
+  // P3-q: track consecutive heartbeat failures to clear stale presence
+  // and trigger re-registration after a gateway restart/reconnect.
+  let heartbeatFailures = 0;
+  const HEARTBEAT_STALE_THRESHOLD = 3; // 3 consecutive failures → stale
   const heartbeat = setInterval(() => {
     if (!identity?.gateway_socket) return;
     new GatewayClient(identity.gateway_socket).call("runtime.heartbeat", {
       runtime_id: identity.runtime_id,
-    }).catch(() => { /* gateway down — retry next tick */ });
+    }).then(() => {
+      // P3-q: success → reset failure counter; restore status if recovering
+      if (heartbeatFailures > 0) {
+        heartbeatFailures = 0;
+        if (reporter) {
+          reporter.setStatus("active");
+          reporter.updateUi("heartbeat recovered");
+        }
+      }
+    }).catch(() => {
+      // P3-q: on failure, increment counter; after threshold, mark stale
+      // and attempt re-registration so the gateway can restore presence
+      // after a restart (runtime.register is idempotent).
+      heartbeatFailures += 1;
+      if (heartbeatFailures >= HEARTBEAT_STALE_THRESHOLD) {
+        if (reporter) {
+          reporter.setStatus("stale");
+          reporter.updateUi(`heartbeat stale (${heartbeatFailures} failures)`);
+        }
+        // Attempt re-registration to restore presence.
+        try {
+          const rc = new GatewayClient(identity.gateway_socket);
+          rc.call("runtime.register", {
+            session_id: identity.session_id,
+            agent_id: identity.agent_id,
+            runtime_id: identity.runtime_id,
+            review_key: identity.review_key,
+            generation: identity.generation,
+            backend_session_id: ctx?.sessionManager?.getSessionId?.() ?? "",
+            runtime: "omp",
+            owner_pid: identity.owner_pid,
+            nonce: identity.nonce,
+          }).then(() => {
+            heartbeatFailures = 0;
+            if (reporter) {
+              reporter.setStatus("active");
+              reporter.updateUi("presence restored after re-register");
+            }
+          }).catch(() => { /* re-register also failed — retry next threshold */ });
+        } catch { /* socket missing — retry next tick */ }
+      }
+    });
     // A13: reconcile widget tool counter with gateway-aggregated tool_stats
     // (bumpTools provides immediate feedback; this is the source-of-truth refresh)
     reporter?.refreshToolStats().catch(() => {});
