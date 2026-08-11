@@ -610,18 +610,23 @@ export async function activate(
 
 // ── Manager console mode ──────────────────────────────────────────────
 
-async function activateManagerConsole(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+async function activateManagerConsole(pi: ExtensionAPI): Promise<void> {
   const gatewaySocket = process.env.POSTMESH_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/postmesh/gateway/control.sock`;
   if (!existsSync(gatewaySocket)) {
     console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
     return;
   }
   const client = new GatewayClient(gatewaySocket);
-  const ui = ctx.ui;
+  let capturedCtx: ExtensionContext | undefined;
+  try {
+    pi.on("session_start", (_evt: unknown, ctx: ExtensionContext) => {
+      capturedCtx = ctx;
+    });
+  } catch { /* hook unavailable */ }
   const render = () => {
-    if (!ctx || ctx.hasUI === false) return;
+    if (!capturedCtx || capturedCtx.hasUI === false) return;
     try {
-      ctx.ui.setStatus("gateway", "gateway connected");
+      capturedCtx.ui.setStatus("gateway", "gateway connected");
     } catch { /* non-fatal */ }
   };
   try {
@@ -636,7 +641,7 @@ async function activateManagerConsole(pi: ExtensionAPI, ctx: ExtensionContext): 
 
 // ── Entry ─────────────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
+export default function (pi: ExtensionAPI): void {
   try {
     writeFileSync(`/tmp/omp-mb-load-${process.pid}.json`, JSON.stringify({
       pid: process.pid,
@@ -644,6 +649,16 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
       loaded_at: new Date().toISOString(),
     }));
   } catch { /* diagnostic only */ }
+
+  // OMP 工厂只传 (api)；ExtensionContext 只能从事件 handler 捕获
+  //（ExtensionHandler 签名 (event, ctx)）。manager console 在自身内部
+  // 捕获；worker 路径在此捕获并传给 activate。
+  let capturedCtx: ExtensionContext | undefined;
+  try {
+    pi.on("session_start", (_evt: unknown, ctx: ExtensionContext) => {
+      capturedCtx = ctx;
+    });
+  } catch { /* hook unavailable */ }
 
   // Dual mode: launcher identity + CODEAGENT_ROLE=worker|oracle → runtime
   // adapter; otherwise (or CODEAGENT_ROLE=manager) → Manager console.
@@ -653,7 +668,7 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
 
   if (!isWorker) {
     console.warn(`[mailbox] manager console mode (role=${role || "unset"})`);
-    activateManagerConsole(pi, ctx).catch((e) => {
+    activateManagerConsole(pi).catch((e) => {
       console.error("[mailbox] manager console failed:", e);
     });
     return;
@@ -671,7 +686,10 @@ export default function (pi: ExtensionAPI, ctx: ExtensionContext): void {
     if (!identity) return;
     clearInterval(idInterval);
     const cfg = buildConfig(identity.session_id, identity.agent_id);
-    activate(pi, ctx, cfg, identityPath).catch((e: unknown) => {
+    // ctx 未捕获（session_start 未触发）时传空对象——RuntimeEventReporter
+    // 会降级为纯 gateway 事件上报（无 UI）。
+    const effectiveCtx = (capturedCtx ?? {}) as ExtensionContext;
+    activate(pi, effectiveCtx, cfg, identityPath).catch((e: unknown) => {
       console.error("[mailbox] activation failed:", e);
     });
   }, IDENTITY_POLL_MS);

@@ -10,6 +10,7 @@ import {
   type Config,
   type GatewayIdentity,
 } from "../src/index";
+import pluginFactory from "../src/index";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 // ── Fake gateway: a UDS server that answers like the real AgentGateway ─
@@ -356,5 +357,46 @@ describe("plugin runtime adapter", () => {
     await activate(pi, mockCtx({ hasUI: false }), cfg(ROOT, "s1", "w1"), identityPath);
     await until(() => fake.requests.some((r) => r.method === "runtime.register"));
     expect(fake.requests.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Factory contract: OMP calls default export with (api) only ────────
+
+describe("factory contract (single-arg pi)", () => {
+  test("manager console path does not touch ctx (no TypeError)", () => {
+    // manager console: no identity env, gateway socket absent → warn + return
+    delete process.env.OMP_MAILBOX_IDENTITY_FILE;
+    delete process.env.CODEAGENT_ROLE;
+
+    let sessionHandler: ((evt: unknown, ctx: ExtensionContext) => void) | null = null;
+    const pi = {
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      on: (evt: string, fn: (evt: unknown, ctx: ExtensionContext) => void) => {
+        if (evt === "session_start") sessionHandler = fn;
+      },
+    } as unknown as ExtensionAPI;
+
+    expect(() => pluginFactory(pi)).not.toThrow();
+    expect(sessionHandler).not.toBeNull();
+  });
+
+  test("session_start handler captures ctx for gateway status UI", () => {
+    delete process.env.OMP_MAILBOX_IDENTITY_FILE;
+    delete process.env.CODEAGENT_ROLE;
+
+    let sessionHandler: ((evt: unknown, ctx: ExtensionContext) => void) | null = null;
+    const pi = {
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      on: (evt: string, fn: (evt: unknown, ctx: ExtensionContext) => void) => {
+        if (evt === "session_start") sessionHandler = fn;
+      },
+    } as unknown as ExtensionAPI;
+
+    pluginFactory(pi);
+    // session_start fires later with a real ctx — must not throw
+    const ctx = mockCtx({ hasUI: true });
+    expect(() => sessionHandler?.({}, ctx)).not.toThrow();
   });
 });
