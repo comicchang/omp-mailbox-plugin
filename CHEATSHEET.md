@@ -1,11 +1,11 @@
 # omp-mailbox-plugin CHEATSHEET
 
-OMP → postmesh mailbox 唤醒桥。快速上手/排障速查。
+OMP → aimeshchat mailbox 唤醒桥。快速上手/排障速查。
 
 ## 一图流
 
 ```
-[发送方] postmesh swarm direct --session s1 --from A --to B ...
+[发送方] aimeshchat swarm direct --session s1 --from A --to B ...
     ↓ (SSH wire / 本地)
 <root>/s1/B/inbox/{msg_id}.json  ← fs.watch 检测
     ↓
@@ -17,8 +17,8 @@ OMP → postmesh mailbox 唤醒桥。快速上手/排障速查。
 ## 快速上手
 
 ```bash
-# 1. 安装 postmesh CLI（提供 mailbox/postmesh）
-uv tool install git+https://github.com/comicchang/postmesh-py.git@v0.2.7
+# 1. 安装 aimeshchat CLI（提供 mailbox/aimeshchat）
+uv tool install git+https://github.com/comicchang/aimeshchat.git@v0.2.7
 
 # 2. 安装插件（dotai setup 或手动）
 cd ~/.omp/plugins && bun add github:comicchang/omp-mailbox-plugin
@@ -39,7 +39,7 @@ env SWARM_SESSION_ID=s1 OMP_WORKER_ID=w1 OMP_MAILBOX_SESSION_ID=s1 \
 #    ③ 真实 wake：发唯一 msg_id → 会话出现 omp-mailbox 通知 + agent 处理
 
 # 6. 发消息触发唤醒
-postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body hello
+aimeshchat swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body hello
 ```
 
 ## 环境变量
@@ -48,7 +48,7 @@ postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body hell
 |---|---|---|
 | `OMP_MAILBOX_IDENTITY_FILE` | Worker | 身份 JSON `{session_id, worker_id}` |
 | `OMP_MAILBOX_SESSION_ID` / `OMP_MAILBOX_AGENT_ID` | Worker | 会话/agent 标识 |
-| `MAILBOX_ROOT` | 否 | 默认 `~/.local/share/postmesh/mailbox` |
+| `MAILBOX_ROOT` | 否 | 默认 `~/.local/share/aimeshchat/mailbox` |
 | `MAILBOX_CLI` | 否 | 默认 PATH `mailbox` |
 
 无 identity env → Manager 会话，插件不激活。
@@ -57,20 +57,20 @@ postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body hell
 
 ```bash
 # 跨主机（SSH wire）
-postmesh mailbox send --session s1 --from A --to B --subject t --body b --host <alias>
-postmesh mailbox peek --session s1 --agent B --host <alias>
-postmesh mailbox read --session s1 --agent B --owner B --host <alias>
-postmesh mailbox finalize --session s1 --agent B --msg-id <id> --owner B --host <alias>
+aimeshchat mailbox send --session s1 --from A --to B --subject t --body b --host <alias>
+aimeshchat mailbox peek --session s1 --agent B --host <alias>
+aimeshchat mailbox read --session s1 --agent B --owner B --host <alias>
+aimeshchat mailbox finalize --session s1 --agent B --msg-id <id> --owner B --host <alias>
 
 # 高级 IPC（session/roster/ACL/channel/broadcast）
-postmesh swarm create-session s1 --manager mgr --members w1,w2
-postmesh swarm register s1 --agent w1 --host <alias>
-postmesh swarm direct s1 --from mgr --to w1 --subject t --body b
-postmesh swarm status s1 --trace <trace_id>     # 按 trace 聚合链路
+aimeshchat swarm create-session s1 --manager mgr --members w1,w2
+aimeshchat swarm register s1 --agent w1 --host <alias>
+aimeshchat swarm direct s1 --from mgr --to w1 --subject t --body b
+aimeshchat swarm status s1 --trace <trace_id>     # 按 trace 聚合链路
 
 # outbox / dead-letter
-postmesh swarm outbox pending|flush|status
-postmesh swarm outbox dead|requeue|purge
+aimeshchat swarm outbox pending|flush|status
+aimeshchat swarm outbox dead|requeue|purge
 ```
 
 ## 排障
@@ -80,7 +80,7 @@ postmesh swarm outbox dead|requeue|purge
 | 无 `[mailbox] identity` 日志 | **勿以 console 日志判加载**（OMP 不 monkey-patch console；fd2 仅 TUI 持有终端期间重定向到 PID 日志）。用三层判据：① load marker 副作用 ② identity 非空 ③ 真实 wake |
 | 有身份但消息不唤醒 | identity 的 worker_id 非空？inbox 路径（MAILBOX_ROOT/session/agent）匹配？watcher 是否就绪（激活 marker）？消息是否已被消费（peek pending=0）？ |
 | agent 收到通知但 inbox 空 | 通知是预览，以 `mailbox read` 为准（勿信通知文本） |
-| `mailbox` command not found | postmesh 未装或 PATH 缺 `~/.local/bin` |
+| `mailbox` command not found | aimeshchat 未装或 PATH 缺 `~/.local/bin` |
 | setup 报 dependency loop | plugins/package.json 的 specifier 非规范（应为 `github:comicchang/omp-mailbox-plugin`，勿加 #commit）→ 还原 + 删 bun.lock |
 
 ## 已知问题（激活前置）

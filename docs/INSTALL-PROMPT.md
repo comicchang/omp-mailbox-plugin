@@ -6,7 +6,7 @@
 ## 背景
 
 omp-mailbox-plugin 让 OMP（oh-my-pi）agent 被跨主机 mailbox 消息唤醒
-（inbox 新消息 → triggerTurn）。依赖 postmesh-py 的 mailbox CLI。
+（inbox 新消息 → triggerTurn）。依赖 aimeshchat 的 mailbox CLI。
 本项目不依赖 dotai——以下安装流程可独立执行。
 
 ## 安装步骤（自动执行）
@@ -22,11 +22,11 @@ command -v omp || echo "NO_OMP"    # 可选（无 omp 则只装 CLI+plugin）
 - `NEED_UV` → 安装：`curl -LsSf https://astral.sh/uv/install.sh | sh`
 - `NO_BUN` → 后续用 npm 替代
 
-### 2. 安装 postmesh CLI（提供 mailbox/postmesh 入口）
+### 2. 安装 aimeshchat CLI（提供 mailbox/aimeshchat 入口）
 
 ```bash
-uv tool install "git+https://github.com/comicchang/postmesh-py.git@v0.2.7" --force
-postmesh --version   # 验证；PATH 缺 ~/.local/bin 时导出
+uv tool install "git+https://github.com/comicchang/aimeshchat.git@v0.2.7" --force
+aimeshchat --version   # 验证；PATH 缺 ~/.local/bin 时导出
 ```
 
 ### 3. 安装插件
@@ -58,7 +58,7 @@ chmod +x "${HOME}/.local/bin/omp-mailbox"
 ### 5. 验证
 
 ```bash
-postmesh --version                       # 期望 v0.2.7
+aimeshchat --version                       # 期望 v0.2.7
 ls "${PLUGIN_ENTRY}"                      # 期望存在
 # 启动测试（可选）：
 # env SWARM_SESSION_ID=s1 OMP_WORKER_ID=w1 OMP_MAILBOX_SESSION_ID=s1 \
@@ -72,12 +72,12 @@ ls "${PLUGIN_ENTRY}"                      # 期望存在
 ## 已知限制（遇到时向用户说明）
 
 1. **激活前置**：identity 的 worker_id 必须非空（launcher 已修复缺省 `worker`；调用方应显式设 OMP_WORKER_ID）。
-2. **跨主机**：发送方需 postmesh CLI + SSH 通路（`postmesh swarm direct ... --host <alias>`）。
-3. 非 OMP agent（opencode/codex）不需要本插件——直接用 `postmesh mailbox`/`swarm` CLI。
+2. **跨主机**：发送方需 aimeshchat CLI + SSH 通路（`aimeshchat swarm direct ... --host <alias>`）。
+3. 非 OMP agent（opencode/codex）不需要本插件——直接用 `aimeshchat mailbox`/`swarm` CLI。
 
 ## 完成标准
 
-- postmesh CLI 可运行（v0.2.7）
+- aimeshchat CLI 可运行（v0.2.7）
 - 插件 entry 存在
 - （有 omp）extensions 配置写入 + omp-mailbox wrapper 生成
 - 向用户报告：安装完成 + 已知限制 + 使用方式（omp-mailbox / agent 轮询）

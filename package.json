@@ -6,7 +6,7 @@
   "omp": {
     "extensions": ["./src/index.ts"]
   },
-  "description": "Thin OMP notification adapter for mailbox protocol (requires canonical mailbox CLI via postmesh-py)",
+  "description": "Thin OMP notification adapter for mailbox protocol (requires canonical mailbox CLI via aimeshchat)",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"

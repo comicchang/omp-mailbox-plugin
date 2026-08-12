@@ -29,7 +29,7 @@ let capturedBackendSessionId = "";
 // also runs at activation) so ~/.omp/mailbox-identity stops accumulating.
 const IDENTITY_CLEANUP_MS = 10 * 60_000;
 
-/** Launcher identity (0600 file created by postmesh, read-only here). */
+/** Launcher identity (0600 file created by aimeshchat, read-only here). */
 export interface GatewayIdentity {
   session_id: string;
   agent_id: string;
@@ -55,7 +55,7 @@ export interface Config {
 }
 
 function buildConfig(sessionId: string, agentId: string): Config {
-  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/postmesh/mailbox`;
+  const root = process.env.MAILBOX_ROOT ?? `${homedir()}/.local/share/aimeshchat/mailbox`;
   const cli = process.env.MAILBOX_CLI ?? "mailbox";
   return { sessionId, agentId, mailboxRoot: root, cliPath: cli, inboxDir: `${root}/${sessionId}/${agentId}/inbox` };
 }
@@ -82,12 +82,12 @@ function versionGte(actual: string, required: string): boolean {
 
 async function checkMailboxCli(cliPath: string): Promise<void> {
   try {
-    const proc = Bun.spawn(["postmesh", "--version"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
+    const proc = Bun.spawn(["aimeshchat", "--version"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
     const out = await new Response(proc.stdout).text();
     const match = out.match(/(\d+\.\d+\.\d+)/);
     if (match && proc.exitCode === 0) {
       if (!versionGte(match[1], MAILBOX_MIN_VERSION)) {
-        console.error(`[mailbox] postmesh version ${match[1]} < required ${MAILBOX_MIN_VERSION}. Please upgrade postmesh.`);
+        console.error(`[mailbox] aimeshchat version ${match[1]} < required ${MAILBOX_MIN_VERSION}. Please upgrade aimeshchat.`);
         throw new Error(`mailbox CLI version too old: ${match[1]} < ${MAILBOX_MIN_VERSION}`);
       }
       return;
@@ -98,11 +98,11 @@ async function checkMailboxCli(cliPath: string): Promise<void> {
     const proc = Bun.spawn([cliPath, "--help"], { stdout: "pipe", stderr: "pipe", timeout: CHECK_TIMEOUT_MS });
     await proc.exited;
     if (proc.exitCode !== 0) {
-      console.error(`[mailbox] CLI '${cliPath}' is not callable (exit ${proc.exitCode}). Is postmesh installed? (pipx install postmesh-py)`);
+      console.error(`[mailbox] CLI '${cliPath}' is not callable (exit ${proc.exitCode}). Is aimeshchat installed? (pipx install aimeshchat)`);
       throw new Error(`mailbox CLI not functional: ${cliPath}`);
     }
   } catch (e) {
-    console.error(`[mailbox] CLI '${cliPath}' not found in PATH. Set MAILBOX_CLI or install postmesh (pipx install postmesh-py).`);
+    console.error(`[mailbox] CLI '${cliPath}' not found in PATH. Set MAILBOX_CLI or install aimeshchat (pipx install aimeshchat).`);
     throw new Error(`mailbox CLI not found: ${cliPath}`);
   }
 }
@@ -963,7 +963,7 @@ export async function activate(
 // ── Manager console mode ──────────────────────────────────────────────
 
 async function activateManagerConsole(pi: ExtensionAPI): Promise<void> {
-  const gatewaySocket = process.env.POSTMESH_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/postmesh/gateway/control.sock`;
+  const gatewaySocket = process.env.AIMESHCHAT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/aimeshchat/gateway/control.sock`;
   if (!existsSync(gatewaySocket)) {
     console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
     return;
