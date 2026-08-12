@@ -823,6 +823,42 @@ export async function activate(
     if (reporter) reporter.report("RUNTIME_STATE", { state: "session_shutdown" });
   });
 
+  // ── model_change / thinking_level_change → runtime.context_set 上报 ──
+  // Q5 §9: default 继承主 agent 当前模型。插件监听模型/思考级别变更，
+  // 原子更新 gateway runtime.context（provider/model/variant/epoch）。
+  // 若 gateway 不可达，静默降级，下个事件重试。
+  let modelContextEpoch = 0;
+  function reportModelContext(ctx: ExtensionContext, thinkingLevel?: string): void {
+    if (!identity?.gateway_socket) return;
+    try {
+      const model = ctx.model;
+      modelContextEpoch += 1;
+      new GatewayClient(identity.gateway_socket).call("runtime.context_set", {
+        runtime_id: identity.runtime_id,
+        session_id: identity.session_id,
+        agent_id: identity.agent_id,
+        provider: model?.provider ?? "unknown",
+        model: model?.id ?? "unknown",
+        variant: model?.requestModelId ?? "",
+        thinking_level: thinkingLevel ?? "default",
+        epoch: modelContextEpoch,
+        updated_at: new Date().toISOString(),
+      }).catch((e) => {
+        console.warn(`[mailbox] runtime.context_set failed (will retry on next event): ${(e as Error).message}`);
+      });
+    } catch (e) {
+      console.warn(`[mailbox] reportModelContext error: ${(e as Error).message}`);
+    }
+  }
+  // 模型变更事件：上报新 provider/model/variant + 递增 epoch
+  on("model_changed", ((_evt: unknown, handlerCtx: ExtensionContext) => {
+    reportModelContext(handlerCtx);
+  }) as never);
+  // 思考级别变更事件：上报新 thinking_level + 递增 epoch
+  on("thinking_level_changed", ((evt: { thinkingLevel?: string }, handlerCtx: ExtensionContext) => {
+    reportModelContext(handlerCtx, evt.thinkingLevel);
+  }) as never);
+
   // ── Watcher: peek + notify only (never consumes; receipts come from
   //    the tool's gateway read). ──────────────────────────────────────
   /** Read the pending message body from its inbox file (peek summary has no body). */
