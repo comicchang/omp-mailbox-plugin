@@ -626,7 +626,7 @@ export async function activate(
                 try {
                     backendSessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
                 } catch { /* session manager may be unavailable pre-session_start */ }
-                // FC-2: 上报 capabilities（park_revive + correlated_turn_ack）
+                // FC-2: 上报 capabilities（park_revive / correlated_turn_ack — 无 _v1 后缀，对齐 Gateway _is_hot 精确匹配）
                 // 以便 Gateway 对 ended/parked agent 走 park-revive 投递链。
                 // omp_agent_id / backend_session_id / generation 供 Gateway
                 // 在投递时校验 binding_epoch 并关联 TURN_TRIGGERED。
@@ -642,7 +642,7 @@ export async function activate(
                     nonce: identity.nonce,
                     // FC-2: 插件身份 + 能力声明
                     omp_agent_id: identity.agent_id,
-                    capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
+                    capabilities: ["park_revive", "correlated_turn_ack"]  // 对齐 Gateway _is_hot 精确匹配：无 _v1 后缀,
                 });
                 initialTask = (handshakeResult.initial_task as string) ?? "";
                 reporter.setStatus("active");
@@ -740,7 +740,7 @@ export async function activate(
       owner_pid: identity.owner_pid,
       nonce: identity.nonce,
       omp_agent_id: identity.agent_id,
-      capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
+      capabilities: ["park_revive", "correlated_turn_ack"]  // 对齐 Gateway _is_hot 精确匹配：无 _v1 后缀,
     }).catch((e) => {
       console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
     });
@@ -1075,7 +1075,7 @@ export async function activate(
             owner_pid: identity.owner_pid,
             nonce: identity.nonce,
             omp_agent_id: identity.agent_id,
-            capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
+            capabilities: ["park_revive", "correlated_turn_ack"]  // 对齐 Gateway _is_hot 精确匹配：无 _v1 后缀,
           }).then(() => {
             heartbeatFailures = 0;
             if (reporter) {
