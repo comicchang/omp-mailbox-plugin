@@ -676,6 +676,7 @@ export async function activate(
     try { pi.on(evt as never, fn as never); } catch { /* hook unavailable */ }
   };
   on("agent_start", () => {
+    ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
     if (reporter) {
       reporter.setStatus("agent-running");
       reporter.report("RUNTIME_STATE", { state: "agent_start" });
@@ -688,6 +689,7 @@ export async function activate(
   // 注意：必须用 handler 的 ctx 参数（session_start 事件的 ExtensionContext），
   // 而非 activate 的外层 ctx（可能是空对象 fallback，getSessionId 恒空）。
   on("session_start", ((_evt: unknown, handlerCtx: ExtensionContext) => {
+    ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
     if (!identity?.gateway_socket) return;
     let backendSessionId = "";
     try {
@@ -710,6 +712,7 @@ export async function activate(
     });
   }) as never);
   on("turn_start", () => {
+    ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
     if (reporter) {
       reporter.report("TURN_STARTED", {});
       reporter.updateUi("turn started");
@@ -745,10 +748,13 @@ export async function activate(
     }
   });
   on("session_shutdown", () => {
-    // Cancel subscriptions + clean up THIS generation identity only.
-    // A hot parked runtime is NOT released by a Manager session switch.
-    if (watcherAc) watcherAc.abort();
-    clearInterval(interval);
+    // FC-1: DO NOT tear down the inbox polling (watcher + interval) here.
+    // A hot parked runtime (park=true oracle) survives session_shutdown —
+    // the poll loop is its ONLY way to hear the next ask, so killing it
+    // here strands steer messages and zombies the runtime. On a real exit
+    // the timers/watchers die with the process; on a park transfer the
+    // loop keeps running, and ensureInboxPolling() self-heals any genuine
+    // teardown on the next session_start/agent_start/turn_start.
     if (reporter) reporter.report("RUNTIME_STATE", { state: "session_shutdown" });
   });
 
@@ -875,8 +881,22 @@ export async function activate(
     } catch (e: unknown) { console.error("[mailbox] poll error:", e); } finally { polling = false; }
   }
 
-  watcherAc = setupWatcher(cfg.inboxDir, poll);
-  const interval = setInterval(() => { poll(); if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll); }, POLL_MS);
+  // FC-1: inbox polling (watcher + interval) is a parked oracle's lifeline —
+  // it MUST survive session_shutdown (park transfer). Nothing clears the
+  // interval on session_shutdown anymore (see both shutdown handlers); this
+  // helper lazily (re)creates watcher + interval so a torn-down loop (older
+  // shutdown path, watcher error) self-heals on the next lifecycle event.
+  let inboxInterval: Timer | undefined;
+  function ensureInboxPolling(): void {
+    if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll);
+    if (!inboxInterval) {
+      inboxInterval = setInterval(() => {
+        poll();
+        if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll);
+      }, POLL_MS);
+    }
+  }
+  ensureInboxPolling();
 
   // P3-19d: sweep stale launcher identity files once at activation, then
   // periodically — otherwise ~/.omp/mailbox-identity accumulates leftovers
@@ -947,8 +967,11 @@ export async function activate(
   }, HEARTBEAT_MS);
 
   pi.on("session_shutdown", () => {
-    if (watcherAc) watcherAc.abort();
-    clearInterval(interval);
+    // FC-1: never tear down the inbox polling here either — a park transfer
+    // fires session_shutdown while the process stays alive, and the poll
+    // loop is the parked oracle's only way to receive the next ask (steer).
+    // heartbeat/cleanup keep their existing shutdown behavior; the poll
+    // watcher + interval survive and self-heal via ensureInboxPolling().
     clearInterval(heartbeat);
     clearInterval(cleanupInterval);
     // P3-19b: flush the latest dedup state (and any pending debounced save)
