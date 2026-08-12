@@ -43,7 +43,9 @@ export interface GatewayIdentity {
 
 interface MailboxSummary {
   pending: number;
-  messages: { from: string; kind: string; subject: string; msg_id: string }[];
+  // FC-2: command_id 来自 Gateway durable command，用于 TURN_TRIGGERED ack。
+  // 消息文件由 Gateway 写入，可能包含 command_id；msg_id 为兜底。
+  messages: { from: string; kind: string; subject: string; msg_id: string; command_id?: string }[];
 }
 
 export interface Config {
@@ -598,6 +600,18 @@ export async function activate(
     }, DEDUP_SAVE_DEBOUNCE_MS);
   };
 
+  // FC-2: park-revive + turn ack — 为每次 sendUserMessage 投递记录
+  // command_id/msg_id/generation，turn_start 事件触发时向 Gateway 回报
+  // TURN_TRIGGERED（关联 command 到实际 turn）。禁止把 sendUserMessage
+  // 未抛异常当成功——只有 Gateway 持久化 ack 后才算 TURN_TRIGGERED。
+  interface PendingTurnAck {
+    commandId: string;
+    msgId: string;
+    generation: number;
+  }
+  // key = msg_id；同一时刻最多一个 pending ack（单消息投递）
+  const pendingTurnAck = new Map<string, PendingTurnAck>();
+
   // ── Gateway handshake (best-effort) ────────────────────────────────
   let reporter: RuntimeEventReporter | null = null;
   let initialTask = "";
@@ -612,6 +626,10 @@ export async function activate(
                 try {
                     backendSessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
                 } catch { /* session manager may be unavailable pre-session_start */ }
+                // FC-2: 上报 capabilities（park_revive + correlated_turn_ack）
+                // 以便 Gateway 对 ended/parked agent 走 park-revive 投递链。
+                // omp_agent_id / backend_session_id / generation 供 Gateway
+                // 在投递时校验 binding_epoch 并关联 TURN_TRIGGERED。
                 handshakeResult = await new GatewayClient(identity.gateway_socket).call("runtime.register", {
                     session_id: identity.session_id,
                     agent_id: identity.agent_id,
@@ -622,6 +640,9 @@ export async function activate(
                     runtime: "omp",
                     owner_pid: identity.owner_pid,
                     nonce: identity.nonce,
+                    // FC-2: 插件身份 + 能力声明
+                    omp_agent_id: identity.agent_id,
+                    capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
                 });
                 initialTask = (handshakeResult.initial_task as string) ?? "";
                 reporter.setStatus("active");
@@ -636,9 +657,19 @@ export async function activate(
         const initialTaskMsgId = (handshakeResult?.initial_task_msg_id as string) ?? "";
         if (initialTask) {
             try {
-                pi.sendUserMessage(initialTask);
-                reporter.updateUi("initial task dispatched");
+                // FC-2: 初始任务也走 turn ack 链 — command_id 从 handshake 响应获取。
+                const initialCmdId = (handshakeResult?.initial_task_command_id as string) ?? initialTaskMsgId;
+                if (initialCmdId) {
+                    pendingTurnAck.set("next", {
+                        commandId: initialCmdId,
+                        msgId: initialTaskMsgId,
+                        generation: identity.generation,
+                    });
+                }
+                pi.sendUserMessage(initialTask, { deliverAs: "steer" });
+                reporter.updateUi("initial task dispatched (park-revive)");
             } catch (e) {
+                pendingTurnAck.delete("next"); // FC-2: 清理失败 ack
                 console.error(`[mailbox] initial task dispatch failed: ${(e as Error).message}`);
             }
         }
@@ -697,6 +728,7 @@ export async function activate(
     } catch { /* not ready yet */ }
     if (backendSessionId) capturedBackendSessionId = backendSessionId; // R4: 缓存供 heartbeat 恢复复用
     if (!backendSessionId) return;
+    // FC-2: re-register 也带 capabilities（idempotent，Gateway 合并）
     new GatewayClient(identity.gateway_socket).call("runtime.register", {
       session_id: identity.session_id,
       agent_id: identity.agent_id,
@@ -707,12 +739,42 @@ export async function activate(
       runtime: "omp",
       owner_pid: identity.owner_pid,
       nonce: identity.nonce,
+      omp_agent_id: identity.agent_id,
+      capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
     }).catch((e) => {
       console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
     });
   }) as never);
   on("turn_start", () => {
     ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
+    // FC-2: turn ack — 若存在 pending ack（由 sendUserMessage 投递前设置），
+    // 向 Gateway 回报 TURN_TRIGGERED，关联 command_id → turn 实际启动。
+    // 只在有 pending ack 时回报（正常 user turn 不触发 ack）。
+    const ack = pendingTurnAck.get("next");
+    if (ack && identity?.gateway_socket) {
+      pendingTurnAck.delete("next");
+      const turnAckClient = new GatewayClient(identity.gateway_socket);
+      turnAckClient.call("runtime.event", {
+        event: {
+          runtime_id: identity.runtime_id,
+          generation: identity.generation,
+          session_id: identity.session_id,
+          agent_id: identity.agent_id,
+          request_id: ack.commandId,
+          run_id: "",
+          kind: "TURN_TRIGGERED",
+          created_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+          payload: {
+            command_id: ack.commandId,
+            msg_id: ack.msgId,
+            generation: ack.generation,
+            turn_id: "", // OMP turn_start 不暴露 turn_id；Gateway 通过时间窗口关联
+          },
+        },
+      }).catch((e) => {
+        console.error(`[mailbox] TURN_TRIGGERED ack failed: ${(e as Error).message}`);
+      });
+    }
     if (reporter) {
       reporter.report("TURN_STARTED", {});
       reporter.updateUi("turn started");
@@ -755,6 +817,9 @@ export async function activate(
     // the timers/watchers die with the process; on a park transfer the
     // loop keeps running, and ensureInboxPolling() self-heals any genuine
     // teardown on the next session_start/agent_start/turn_start.
+    // FC-2: 清理 pendingTurnAck — session_shutdown 表示当前 turn 已结束，
+    // 未被 turn_start 消费的 ack 不应残留到下一轮。
+    pendingTurnAck.clear();
     if (reporter) reporter.report("RUNTIME_STATE", { state: "session_shutdown" });
   });
 
@@ -829,6 +894,10 @@ export async function activate(
           // A11.4: claim degradation — when the agent has no claim tool
           // (e.g. oracle with restricted tools), auto read+finalize the
           // message and direct-deliver its body as a user turn.
+          // FC-2: 增加 park-revive + turn ack 链 — claim → finalize →
+          // 设置 pendingTurnAck（command_id 来自消息或 Gateway response）
+          // → sendUserMessage(deliverAs=steer) 唤醒 parked agent →
+          // turn_start 事件触发 TURN_TRIGGERED ack。
           if (identity?.gateway_socket && !agentHasClaimTool(pi) && msg.kind === "TASK") {
             try {
               const claimClient = new GatewayClient(identity.gateway_socket);
@@ -850,13 +919,30 @@ export async function activate(
                   owner: cfg.agentId,
                 });
               }
-              // A11.4: direct delivery as a real user turn
-              pi.sendUserMessage(body || msg.subject || msg.kind);
+              // FC-2: command_id 优先取消息自带字段（Gateway durable command），
+              // 兜底取 message.read 返回的 command_id，最后 fallback 到 msg_id。
+              const cmdId = msg.command_id
+                ?? (read.message as { command_id?: string } | null)?.command_id
+                ?? claimedId;
+              // FC-2: 设置 pendingTurnAck — turn_start 事件将用它回报
+              // TURN_TRIGGERED 给 Gateway。禁止把 sendUserMessage 未抛异常
+              // 当成功——只有 turn_start 确认 turn 已启动。
+              pendingTurnAck.set("next", {
+                commandId: cmdId,
+                msgId: claimedId,
+                generation: identity.generation,
+              });
+              // FC-2: deliverAs="steer" 用于 park-revive 唤醒 parked agent。
+              // sendUserMessage 对 idle agent 启动 turn，对 streaming agent
+              // 排队为 steer——两者都唤醒 ended/parked agent 进入新 turn。
+              pi.sendUserMessage(body || msg.subject || msg.kind, { deliverAs: "steer" });
               seen.add(msg.msg_id);
               if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
               scheduleDedupSave(); // P3-19b
-              if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)}`);
+              if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)} (park-revive)`);
             } catch (e) {
+              // FC-2: 投递失败时清理 pendingTurnAck，避免 stale ack
+              pendingTurnAck.delete("next");
               console.error("[mailbox] claim fallback failed, retrying later:", e);
               continue;
             }
@@ -941,6 +1027,7 @@ export async function activate(
         // Attempt re-registration to restore presence.
         try {
           const rc = new GatewayClient(identity.gateway_socket);
+          // FC-2: heartbeat re-register 也带 capabilities
           rc.call("runtime.register", {
             session_id: identity.session_id,
             agent_id: identity.agent_id,
@@ -951,6 +1038,8 @@ export async function activate(
             runtime: "omp",
             owner_pid: identity.owner_pid,
             nonce: identity.nonce,
+            omp_agent_id: identity.agent_id,
+            capabilities: ["park_revive_v1", "correlated_turn_ack_v1"],
           }).then(() => {
             heartbeatFailures = 0;
             if (reporter) {
