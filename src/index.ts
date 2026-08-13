@@ -602,8 +602,11 @@ export async function activate(
 
   // FC-2: park-revive + turn ack — 为每次 sendUserMessage 投递记录
   // command_id/msg_id/generation，turn_start 事件触发时向 Gateway 回报
-  // TURN_TRIGGERED（关联 command 到实际 turn）。禁止把 sendUserMessage
-  // 未抛异常当成功——只有 Gateway 持久化 ack 后才算 TURN_TRIGGERED。
+  // TURN_TRIGGERED（关联 command 到实际 turn）。
+  // P1-1: command_id（= Gateway 写 mailbox 时携带的 request_id）作为
+  // runtime.command_ack 的 request_id 回传，命中命令表主键推进状态机。
+  // 禁止把 sendUserMessage 未抛异常当成功——只有 Gateway 持久化 ack
+  // 后才算 TURN_TRIGGERED。
   interface PendingTurnAck {
     commandId: string;
     msgId: string;
@@ -747,30 +750,21 @@ export async function activate(
   }) as never);
   on("turn_start", () => {
     ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
-    // FC-2: turn ack — 若存在 pending ack（由 sendUserMessage 投递前设置），
-    // 向 Gateway 回报 TURN_TRIGGERED，关联 command_id → turn 实际启动。
+    // P1-1: turn ack 改走 runtime.command_ack —— Gateway 命令表主键是
+    // request_id，mailbox 消息已带 command_id（= request_id），此处以
+    // ack.commandId 作为 request_id 上报 TURN_TRIGGERED，直接推进命令
+    // 状态机（跳级自动补齐 QUEUED→CLAIMED→REVIVING→TRIGGERING）。
     // 只在有 pending ack 时回报（正常 user turn 不触发 ack）。
     const ack = pendingTurnAck.get("next");
     if (ack && identity?.gateway_socket) {
       pendingTurnAck.delete("next");
       const turnAckClient = new GatewayClient(identity.gateway_socket);
-      turnAckClient.call("runtime.event", {
-        event: {
-          runtime_id: identity.runtime_id,
-          generation: identity.generation,
-          session_id: identity.session_id,
-          agent_id: identity.agent_id,
-          request_id: ack.commandId,
-          run_id: "",
-          kind: "TURN_TRIGGERED",
-          created_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-          payload: {
-            command_id: ack.commandId,
-            msg_id: ack.msgId,
-            generation: ack.generation,
-            turn_id: "", // OMP turn_start 不暴露 turn_id；Gateway 通过时间窗口关联
-          },
-        },
+      turnAckClient.call("runtime.command_ack", {
+        request_id: ack.commandId, // = mailbox command_id = Gateway 命令表主键
+        state: "TURN_TRIGGERED",
+        runtime_id: identity.runtime_id,
+        generation: identity.generation,
+        turn_id: "", // OMP turn_start 不暴露 turn_id；Gateway 通过时间窗口关联
       }).catch((e) => {
         console.error(`[mailbox] TURN_TRIGGERED ack failed: ${(e as Error).message}`);
       });
@@ -960,9 +954,11 @@ export async function activate(
               const cmdId = msg.command_id
                 ?? (read.message as { command_id?: string } | null)?.command_id
                 ?? claimedId;
-              // FC-2: 设置 pendingTurnAck — turn_start 事件将用它回报
-              // TURN_TRIGGERED 给 Gateway。禁止把 sendUserMessage 未抛异常
-              // 当成功——只有 turn_start 确认 turn 已启动。
+              // FC-2: 设置 pendingTurnAck — turn_start 事件将用它经
+              // runtime.command_ack 回报 TURN_TRIGGERED 给 Gateway
+              // （request_id = cmdId = mailbox command_id，对齐命令表主键）。
+              // 禁止把 sendUserMessage 未抛异常当成功——只有 turn_start
+              // 确认 turn 已启动。
               pendingTurnAck.set("next", {
                 commandId: cmdId,
                 msgId: claimedId,
