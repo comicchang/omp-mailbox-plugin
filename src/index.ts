@@ -286,10 +286,12 @@ function cleanupIdentityDir(identityDir: string, ownPath: string): void {
       const data = JSON.parse(readFileSync(p, "utf-8")) as { owner_pid?: unknown };
       const pid = typeof data.owner_pid === "number" ? data.owner_pid : 0;
       if (!pid) {
-        stale = true; // no owner info — cannot be a live launcher identity
-      } else {
-        try { process.kill(pid, 0); } catch { stale = true; }
+        // No owner_pid = explicitly long-lived identity (e.g. written by
+        // `swarm attach` for hand-launched interactive peers). Never sweep —
+        // the user manages its lifecycle manually.
+        continue;
       }
+      try { process.kill(pid, 0); } catch { stale = true; }
     } catch { stale = true; } // corrupt/unreadable → stale
     if (stale) {
       try { unlinkSync(p); } catch { /* raced with another sweep — ignore */ }
