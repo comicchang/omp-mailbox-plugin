@@ -732,6 +732,10 @@ export async function activate(
     ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
     if (!identity?.gateway_socket) return;
 
+    // R5: retry up to60 times (120s total) to cover the CLI's120s binding window.
+    // Both getSessionId() empty AND RPC failure trigger retry.
+    const MAX_RETRIES = 60;
+    const RETRY_INTERVAL_MS = 2000;
     const tryRegister = (attempt: number) => {
       let backendSessionId = "";
       try {
@@ -753,13 +757,17 @@ export async function activate(
           omp_agent_id: identity.agent_id,
           capabilities: ["park_revive", "correlated_turn_ack"],
         }).catch((e) => {
-          console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
+          // R5: RPC failure also retries (gateway transient error)
+          console.warn(`[mailbox] session_start re-register failed (attempt ${attempt + 1}): ${(e as Error).message}`);
+          if (attempt + 1 < MAX_RETRIES) {
+            setTimeout(() => tryRegister(attempt + 1), RETRY_INTERVAL_MS);
+          }
         });
-      } else if (attempt < 5) {
+      } else if (attempt + 1 < MAX_RETRIES) {
         // R5: session manager not ready yet — retry after delay
-        setTimeout(() => tryRegister(attempt + 1), 2000);
+        setTimeout(() => tryRegister(attempt + 1), RETRY_INTERVAL_MS);
       } else {
-        console.warn("[mailbox] session_start: getSessionId() still empty after 5 retries — gateway binding will remain pending");
+        console.warn("[mailbox] session_start: getSessionId() still empty after 60 retries (120s) — gateway binding will remain pending");
       }
     };
     tryRegister(0);
