@@ -724,31 +724,45 @@ export async function activate(
   // can sync it into the park manifest (warm resume across gateway restarts).
   // 注意：必须用 handler 的 ctx 参数（session_start 事件的 ExtensionContext），
   // 而非 activate 的外层 ctx（可能是空对象 fallback，getSessionId 恒空）。
+  //
+  // R5: getSessionId() may still be empty at session_start if the session
+  // manager initializes asynchronously. Schedule retries (5 attempts, 2s apart)
+  // so the gateway eventually gets the real backend_session_id.
   on("session_start", ((_evt: unknown, handlerCtx: ExtensionContext) => {
     ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
     if (!identity?.gateway_socket) return;
-    let backendSessionId = "";
-    try {
-      backendSessionId = handlerCtx?.sessionManager?.getSessionId?.() ?? "";
-    } catch { /* not ready yet */ }
-    if (backendSessionId) capturedBackendSessionId = backendSessionId; // R4: 缓存供 heartbeat 恢复复用
-    if (!backendSessionId) return;
-    // FC-2: re-register 也带 capabilities（idempotent，Gateway 合并）
-    new GatewayClient(identity.gateway_socket).call("runtime.register", {
-      session_id: identity.session_id,
-      agent_id: identity.agent_id,
-      runtime_id: identity.runtime_id,
-      review_key: identity.review_key,
-      generation: identity.generation,
-      backend_session_id: backendSessionId,
-      runtime: "omp",
-      owner_pid: identity.owner_pid,
-      nonce: identity.nonce,
-      omp_agent_id: identity.agent_id,
-      capabilities: ["park_revive", "correlated_turn_ack"]  // 对齐 Gateway _is_hot 精确匹配：无 _v1 后缀,
-    }).catch((e) => {
-      console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
-    });
+
+    const tryRegister = (attempt: number) => {
+      let backendSessionId = "";
+      try {
+        backendSessionId = handlerCtx?.sessionManager?.getSessionId?.() ?? "";
+      } catch { /* not ready yet */ }
+      if (backendSessionId) {
+        capturedBackendSessionId = backendSessionId; // R4: 缓存供 heartbeat 恢复复用
+        // FC-2: re-register 也带 capabilities（idempotent，Gateway 合并）
+        new GatewayClient(identity.gateway_socket).call("runtime.register", {
+          session_id: identity.session_id,
+          agent_id: identity.agent_id,
+          runtime_id: identity.runtime_id,
+          review_key: identity.review_key,
+          generation: identity.generation,
+          backend_session_id: backendSessionId,
+          runtime: "omp",
+          owner_pid: identity.owner_pid,
+          nonce: identity.nonce,
+          omp_agent_id: identity.agent_id,
+          capabilities: ["park_revive", "correlated_turn_ack"],
+        }).catch((e) => {
+          console.error(`[mailbox] session_start re-register failed: ${(e as Error).message}`);
+        });
+      } else if (attempt < 5) {
+        // R5: session manager not ready yet — retry after delay
+        setTimeout(() => tryRegister(attempt + 1), 2000);
+      } else {
+        console.warn("[mailbox] session_start: getSessionId() still empty after 5 retries — gateway binding will remain pending");
+      }
+    };
+    tryRegister(0);
   }) as never);
   on("turn_start", () => {
     ensureInboxPolling(); // FC-1: self-heal any torn-down inbox polling
