@@ -6,7 +6,7 @@ No relay daemon —跨主机通信走 SSH wire protocol（Mode B Remote Transpor
 同一主机共享 mailbox root（Mode A Shared FS）亦可。
 
 **检测**：`fs.watch`（zero-latency, rename+create）+ 30s interval fallback + `agent_end` 立即检查。
-**唤醒**：inbox 新消息 → `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })`。
+**唤醒**：首次 inbox 新消息 → `pi.sendMessage({ triggerTurn: true, deliverAs: "nextTurn" })`；未领取消息仅低频重推。
 **激活**：deferred —— 读 launcher 注入的身份 env（`OMP_MAILBOX_IDENTITY_FILE`）。
 
 ```
@@ -65,7 +65,7 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 1. `fs.watch` 监听 `<root>/<session>/<agent>/inbox`（rename/create 事件，zero-latency）
 2. 30s interval fallback + `agent_end` 后立即检查
 3. `mailbox peek --session <id> --agent <id>`（非消费）→ 新消息按 `msg_id` 去重（滚动集合 max 100）
-4. 每条新消息 → `sendMessage({ triggerTurn: true })` → 唤醒空闲 agent
+4. 首次发现 → `sendMessage({ triggerTurn: true })`；未领取消息每 5 分钟最多重推 2 次，消息首次通知起 30 分钟后停止通知；领取后记入 `seen`
 
 **关键纪律**：插件只通知、永不消费。agent 以 `mailbox read` 的 inbox 为准。
 

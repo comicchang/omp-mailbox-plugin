@@ -9,10 +9,12 @@ const IDENTITY_POLL_MS = 2_000;
 const CHECK_TIMEOUT_MS = 5_000;
 const GATEWAY_TIMEOUT_MS = 5_000;
 const MAX_DEDUP_IDS = 100;
+export const MAX_NOTIFY_COUNT = 3;
+export const MESSAGE_TTL_MS = 30 * 60 * 1000;
 const MAILBOX_MIN_VERSION = "0.1.0";
 const MAX_UI_ENTRIES = 50;
 const UI_DEBOUNCE_MS = 500;
-const RETRY_NOTIFY_MS = 300_000; // A11.3: re-push interval for unclaimed messages (was 60s)
+export const RETRY_NOTIFY_MS = 300_000; // A11.3: re-push interval for unclaimed messages (was 60s)
 // P3-19b: dedup state is persisted so a crashed/restarted runtime never
 // re-pushes (with triggerTurn) messages already notified, nor re-notifies
 // consumed ones. Saved debounced + on shutdown.
@@ -301,43 +303,96 @@ function cleanupIdentityDir(identityDir: string, ownPath: string): void {
 
 // ── Dedup state persistence (P3-19b) ──────────────────────────────────
 
+export interface NotificationStats {
+  firstAt: number;
+  lastAt: number;
+  count: number;
+}
+
+export function shouldNotify(stats: NotificationStats | undefined, now: number): boolean {
+  if (!stats) return true;
+  if (stats.count >= MAX_NOTIFY_COUNT) return false;
+  if (now - stats.firstAt >= MESSAGE_TTL_MS) return false;
+  return now - stats.lastAt >= RETRY_NOTIFY_MS;
+}
+
+function validNotificationStats(value: unknown): NotificationStats | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<NotificationStats>;
+  if (
+    typeof candidate.firstAt !== "number" ||
+    !Number.isFinite(candidate.firstAt) ||
+    typeof candidate.lastAt !== "number" ||
+    !Number.isFinite(candidate.lastAt) ||
+    typeof candidate.count !== "number" ||
+    !Number.isInteger(candidate.count) ||
+    candidate.count < 1
+  ) {
+    return undefined;
+  }
+  return {
+    firstAt: candidate.firstAt,
+    lastAt: candidate.lastAt,
+    count: candidate.count,
+  };
+}
+
 interface DedupState {
   seen: string[];
-  notifiedAt: Record<string, number>; // msg_id → last notified epoch ms
+  notifyStats?: Record<string, NotificationStats>;
+  /** Legacy msg_id → last notified epoch ms representation. */
+  notifiedAt?: Record<string, number>;
   savedAt: number;
+}
+function loadDedupState(cfg: Config): { seen: Set<string>; notifyStats: Map<string, NotificationStats> } {
+  const seen = new Set<string>();
+  const notifyStats = new Map<string, NotificationStats>();
+  try {
+    const state = JSON.parse(readFileSync(dedupStatePath(cfg), "utf-8")) as Partial<DedupState>;
+    if (Array.isArray(state.seen)) for (const id of state.seen) if (typeof id === "string") seen.add(id);
+    if (state.notifyStats && typeof state.notifyStats === "object") {
+      for (const [id, value] of Object.entries(state.notifyStats)) {
+        const stats = validNotificationStats(value);
+        if (stats) notifyStats.set(id, stats);
+      }
+    }
+    // Migrate the previous msg_id → last timestamp format as one notification.
+    if (state.notifiedAt && typeof state.notifiedAt === "object") {
+      for (const [id, timestamp] of Object.entries(state.notifiedAt)) {
+        if (notifyStats.has(id) || typeof timestamp !== "number" || !Number.isFinite(timestamp)) continue;
+        notifyStats.set(id, { firstAt: timestamp, lastAt: timestamp, count: 1 });
+      }
+    }
+  } catch { /* no state yet — fresh start */ }
+  while (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+  while (notifyStats.size > MAX_DEDUP_IDS) notifyStats.delete(notifyStats.keys().next().value!);
+  return { seen, notifyStats };
 }
 
 function dedupStatePath(cfg: Config): string {
   return `${cfg.mailboxRoot}/${cfg.sessionId}/${cfg.agentId}/${DEDUP_STATE_FILE}`;
 }
 
-/** Load persisted dedup state; returns empty sets when absent/corrupt. */
-function loadDedupState(cfg: Config): { seen: Set<string>; notifiedAt: Map<string, number> } {
-  const seen = new Set<string>();
-  const notifiedAt = new Map<string, number>();
-  try {
-    const state = JSON.parse(readFileSync(dedupStatePath(cfg), "utf-8")) as Partial<DedupState>;
-    if (Array.isArray(state.seen)) for (const id of state.seen) if (typeof id === "string") seen.add(id);
-    if (state.notifiedAt && typeof state.notifiedAt === "object") {
-      for (const [id, ts] of Object.entries(state.notifiedAt)) {
-        if (typeof ts === "number") notifiedAt.set(id, ts);
-      }
-    }
-  } catch { /* no state yet — fresh start */ }
-  // Bound restored state to the same caps the runtime enforces in memory.
-  while (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
-  while (notifiedAt.size > MAX_DEDUP_IDS) notifiedAt.delete(notifiedAt.keys().next().value!);
-  return { seen, notifiedAt };
-}
 
 /** Persist dedup state (tmp + rename so a crash mid-write cannot corrupt). */
-function persistDedupState(cfg: Config, seen: Set<string>, notifiedAt: Map<string, number>): void {
+function persistDedupState(cfg: Config, seen: Set<string>, notifyStats: Map<string, NotificationStats>): void {
   try {
     const dir = `${cfg.mailboxRoot}/${cfg.sessionId}/${cfg.agentId}`;
     mkdirSync(dir, { recursive: true });
     const target = dedupStatePath(cfg);
     const tmp = `${target}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ seen: [...seen], notifiedAt: Object.fromEntries(notifiedAt), savedAt: Date.now() } satisfies DedupState));
+    const legacyNotifiedAt = Object.fromEntries(
+      [...notifyStats].map(([id, stats]) => [id, stats.lastAt]),
+    );
+    writeFileSync(
+      tmp,
+      JSON.stringify({
+        seen: [...seen],
+        notifyStats: Object.fromEntries(notifyStats),
+        notifiedAt: legacyNotifiedAt,
+        savedAt: Date.now(),
+      } satisfies DedupState),
+    );
     try { renameSync(tmp, target); } catch { unlinkSync(tmp); /* retried on next change */ }
   } catch { /* state dir unwritable — dedup degrades to in-memory only */ }
 }
@@ -590,15 +645,15 @@ export async function activate(
   // P3-19b: dedup state persisted across restarts (see loadDedupState) —
   // a crashed runtime must not re-push+triggerTurn messages already
   // notified, nor re-notify consumed ones.
-  const { seen, notifiedAt } = loadDedupState(cfg);
-  // P3-19b: debounced save whenever seen/notifiedAt change; flushed
+  const { seen, notifyStats } = loadDedupState(cfg);
+  // P3-19b: debounced save whenever seen/notifyStats change; flushed
   // synchronously on session_shutdown so the latest state survives crashes.
   let dedupSaveTimer: Timer | undefined;
   const scheduleDedupSave = (): void => {
     clearTimeout(dedupSaveTimer);
     dedupSaveTimer = setTimeout(() => {
       dedupSaveTimer = undefined;
-      persistDedupState(cfg, seen, notifiedAt);
+      persistDedupState(cfg, seen, notifyStats);
     }, DEDUP_SAVE_DEBOUNCE_MS);
   };
 
@@ -916,10 +971,10 @@ export async function activate(
       // Messages no longer in peek (pending=0) have been claimed/finalized.
       // Runs before the empty-check so bookkeeping keeps up even when the
       // inbox just drained to zero.
-      for (const [msgId] of notifiedAt) {
+      for (const [msgId] of notifyStats) {
         if (!result.messages.some((m) => m.msg_id === msgId)) {
           seen.add(msgId);
-          notifiedAt.delete(msgId);
+          notifyStats.delete(msgId);
           if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
           scheduleDedupSave(); // P3-19b
         }
@@ -927,9 +982,12 @@ export async function activate(
       if (result.messages.length === 0) return;
       for (const msg of result.messages) {
         if (seen.has(msg.msg_id)) continue;
-        const firstPush = !notifiedAt.has(msg.msg_id); // A11.3
-        // A11.3: second+ push waits RETRY_NOTIFY_MS (was 60s, now 300s)
-        if (!firstPush && Date.now() - notifiedAt.get(msg.msg_id)! < RETRY_NOTIFY_MS) continue;
+        const stats = notifyStats.get(msg.msg_id); // A11.3
+        const firstPush = stats === undefined;
+        // A11.3: second+ push waits RETRY_NOTIFY_MS and is bounded by
+        // MAX_NOTIFY_COUNT / MESSAGE_TTL_MS.
+        const now = Date.now();
+        if (!shouldNotify(stats, now)) continue;
         try {
           // Delivery mode: in-loop messages use "steer" while the agent is
           // running; idle / turn wrap-up uses "nextTurn" (hidden from the
@@ -1012,8 +1070,14 @@ export async function activate(
               details: { from: msg.from, kind: msg.kind, subject: msg.subject, body } },
             { triggerTurn: firstPush, deliverAs }, // A11.3: triggerTurn only on first push
           );
-          notifiedAt.set(msg.msg_id, Date.now());
-          if (notifiedAt.size > MAX_DEDUP_IDS) notifiedAt.delete(notifiedAt.keys().next().value!);
+          const notifiedAt = Date.now();
+          notifyStats.set(
+            msg.msg_id,
+            stats
+              ? { ...stats, lastAt: notifiedAt, count: stats.count + 1 }
+              : { firstAt: notifiedAt, lastAt: notifiedAt, count: 1 },
+          );
+          if (notifyStats.size > MAX_DEDUP_IDS) notifyStats.delete(notifyStats.keys().next().value!);
           scheduleDedupSave(); // P3-19b
         } catch (e: unknown) {
           console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
@@ -1122,7 +1186,7 @@ export async function activate(
     // P3-19b: flush the latest dedup state (and any pending debounced save)
     // so a restart never re-pushes messages already handled.
     clearTimeout(dedupSaveTimer);
-    persistDedupState(cfg, seen, notifiedAt);
+    persistDedupState(cfg, seen, notifyStats);
   });
 
   poll();

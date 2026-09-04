@@ -2,7 +2,15 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { activate, type Config } from "../src/index";
+import {
+  activate,
+  MAX_NOTIFY_COUNT,
+  MESSAGE_TTL_MS,
+  RETRY_NOTIFY_MS,
+  shouldNotify,
+  type Config,
+  type NotificationStats,
+} from "../src/index";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 // Check if canonical mailbox CLI is available on PATH
@@ -15,6 +23,69 @@ try {
 }
 
 const describeOrSkip = MAILBOX_ON_PATH ? describe : describe.skip;
+
+describe("notification budget", () => {
+  const stats = (overrides: Partial<NotificationStats> = {}): NotificationStats => ({
+    firstAt: 0,
+    lastAt: 0,
+    count: 1,
+    ...overrides,
+  });
+
+  test("allows the first notification", () => {
+    expect(shouldNotify(undefined, 0)).toBe(true);
+  });
+
+  test("enforces the retry interval", () => {
+    expect(shouldNotify(stats(), RETRY_NOTIFY_MS - 1)).toBe(false);
+    expect(shouldNotify(stats(), RETRY_NOTIFY_MS)).toBe(true);
+  });
+
+  test("stops after the notification count cap", () => {
+    expect(shouldNotify(stats({ count: MAX_NOTIFY_COUNT }), RETRY_NOTIFY_MS)).toBe(false);
+  });
+
+  test("stops when the message TTL expires", () => {
+    expect(shouldNotify(stats(), MESSAGE_TTL_MS - 1)).toBe(true);
+    expect(shouldNotify(stats(), MESSAGE_TTL_MS)).toBe(false);
+  });
+
+  test("allows notification at count MAX_NOTIFY_COUNT - 1 within retry window", () => {
+    expect(shouldNotify(stats({ count: MAX_NOTIFY_COUNT - 1 }), RETRY_NOTIFY_MS)).toBe(true);
+  });
+
+  test("full lifecycle: three notifications then blocked", () => {
+    // First notification (no stats)
+    expect(shouldNotify(undefined, 0)).toBe(true);
+
+    // After first notification, wait for retry
+    const afterFirst: NotificationStats = { firstAt: 0, lastAt: 0, count: 1 };
+    expect(shouldNotify(afterFirst, RETRY_NOTIFY_MS - 1)).toBe(false); // too early
+    expect(shouldNotify(afterFirst, RETRY_NOTIFY_MS)).toBe(true); // retry window elapsed
+
+    // After second notification
+    const afterSecond: NotificationStats = { firstAt: 0, lastAt: RETRY_NOTIFY_MS, count: 2 };
+    expect(shouldNotify(afterSecond, RETRY_NOTIFY_MS * 2 - 1)).toBe(false); // too early
+    expect(shouldNotify(afterSecond, RETRY_NOTIFY_MS * 2)).toBe(true); // retry window elapsed
+
+    // After third notification (count = MAX_NOTIFY_COUNT)
+    const afterThird: NotificationStats = { firstAt: 0, lastAt: RETRY_NOTIFY_MS * 2, count: MAX_NOTIFY_COUNT };
+    expect(shouldNotify(afterThird, RETRY_NOTIFY_MS * 3)).toBe(false); // count exhausted
+  });
+
+  test("TTL expires during retry cycle", () => {
+    // Start near TTL boundary
+    const nearTtl = MESSAGE_TTL_MS - RETRY_NOTIFY_MS;
+    const stats1: NotificationStats = { firstAt: 0, lastAt: 0, count: 1 };
+
+    // Retry allowed (within TTL)
+    expect(shouldNotify(stats1, nearTtl)).toBe(true);
+
+    // After retry, TTL expired
+    const stats2: NotificationStats = { firstAt: 0, lastAt: nearTtl, count: 2 };
+    expect(shouldNotify(stats2, MESSAGE_TTL_MS)).toBe(false); // TTL expired
+  });
+});
 
 // Mock ExtensionAPI — named types, no inline imports / ReturnType.
 interface SentMessage {
