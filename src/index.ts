@@ -248,8 +248,9 @@ export function readIdentityFile(path: string): GatewayIdentity | null {
     if (ownerPid) {
       try {
         process.kill(ownerPid, 0); // signal 0 = existence check
-      } catch {
-        return null; // PID no longer alive — stale identity
+      } catch (e) {
+        // EPERM = 进程存在但属于其它用户（Windows / 多用户）；只有 ESRCH 才是 owner 已死。
+        if ((e as NodeJS.ErrnoException)?.code !== "EPERM") return null;
       }
       // P3-19c: an alive pid may have been recycled by an unrelated process
       // (the original launcher died, kernel reused the number). The launcher
@@ -335,6 +336,21 @@ export function shouldNotify(stats: NotificationStats | undefined, now: number):
   return now - stats.lastAt >= RETRY_NOTIFY_MS;
 }
 
+export function isNotificationExhausted(stats: NotificationStats, now: number): boolean {
+  return stats.count >= MAX_NOTIFY_COUNT || now - stats.firstAt >= MESSAGE_TTL_MS;
+}
+
+/** Trim notifyStats to MAX_DEDUP_IDS, dropping exhausted budgets first so a
+ *  FIFO eviction never resets a still-live message's wake budget. */
+export function evictNotifyStats(notifyStats: Map<string, NotificationStats>, now: number): void {
+  if (notifyStats.size <= MAX_DEDUP_IDS) return;
+  for (const [id, stats] of notifyStats) {
+    if (notifyStats.size <= MAX_DEDUP_IDS) break;
+    if (isNotificationExhausted(stats, now)) notifyStats.delete(id);
+  }
+  while (notifyStats.size > MAX_DEDUP_IDS) notifyStats.delete(notifyStats.keys().next().value!);
+}
+
 function validNotificationStats(value: unknown): NotificationStats | undefined {
   if (!value || typeof value !== "object") return undefined;
   const candidate = value as Partial<NotificationStats>;
@@ -384,7 +400,7 @@ function loadDedupState(cfg: Config): { seen: Set<string>; notifyStats: Map<stri
     }
   } catch { /* no state yet — fresh start */ }
   while (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
-  while (notifyStats.size > MAX_DEDUP_IDS) notifyStats.delete(notifyStats.keys().next().value!);
+  evictNotifyStats(notifyStats, Date.now());
   return { seen, notifyStats };
 }
 
@@ -727,6 +743,7 @@ export async function activate(
   // runtime.command_ack 的 request_id 回传，命中命令表主键推进状态机。
   // 禁止把 sendUserMessage 未抛异常当成功——只有 Gateway 持久化 ack
   // 后才算 TURN_TRIGGERED。
+  // read/claim 在投递前，finalize 只在 turn_start 确认 turn 已启动后执行。
   interface PendingTurnAck {
     commandId: string;
     msgId: string;
@@ -796,8 +813,9 @@ export async function activate(
                 console.error(`[mailbox] initial task dispatch failed: ${(e as Error).message}`);
             }
         }
-        // Consume the delivered initial task (claim + finalize) so a stale
+        // Consume the delivered initial task (claim only) so a stale
         // unclaimed TASK is never re-delivered on the next warm resume.
+        // claim 在此，finalize 由 turn_start handler 在 turn 确认后执行。
         if (identity.gateway_socket && initialTaskMsgId) {
             try {
                 const client = new GatewayClient(identity.gateway_socket);
@@ -811,13 +829,7 @@ export async function activate(
                 });
                 const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? "";
                 if (claimedId) {
-                    await client.call("message.finalize", {
-                        session_id: identity.session_id,
-                        agent: identity.agent_id,
-                        msg_id: claimedId,
-                        owner: identity.agent_id,
-                    });
-                    reporter.updateUi(`initial task ${claimedId.slice(0, 8)} consumed`);
+                    reporter.updateUi(`initial task ${claimedId.slice(0, 8)} claimed (finalize deferred to turn_start)`);
                 }
             } catch (e) {
                 console.error(`[mailbox] initial task consume failed: ${(e as Error).message}`);
@@ -910,6 +922,15 @@ export async function activate(
       }).catch((e) => {
         console.error(`[mailbox] TURN_TRIGGERED ack failed: ${(e as Error).message}`);
       });
+      if (ack.msgId) {
+        new GatewayClient(identity.gateway_socket).call("message.finalize", {
+          session_id: identity.session_id,
+          agent: identity.agent_id,
+          msg_id: ack.msgId,
+          owner: identity.agent_id,
+        }).catch((e) => console.warn(
+          `[mailbox] finalize after turn_start failed: ${(e as Error).message}`));
+      }
     }
     if (reporter) {
       reporter.report("TURN_STARTED", {});
@@ -1027,9 +1048,9 @@ export async function activate(
     polling = true;
     try {
       const result = await runPeek(cfg);
-      if (reporter) reporter.setPending(result?.pending ?? 0);
+      if (!result) return; // peek 失败：保留上一次 widget 状态，不伪装成空 inbox
+      if (reporter) reporter.setPending(result.pending);
       if (reporter) renderUi(ctx, reporter.snapshot());
-      if (!result) return;
       // A11.2: consumed messages → seen.add immediately (no 5s delay).
       // Messages no longer in peek (pending=0) have been claimed/finalized.
       // Runs before the empty-check so bookkeeping keeps up even when the
@@ -1067,12 +1088,13 @@ export async function activate(
           const bodyBlock = body ? `\n${body}\n` : "";
 
           // A11.4: claim degradation — when the agent has no claim tool
-          // (e.g. oracle with restricted tools), auto read+finalize the
-          // message and direct-deliver its body as a user turn.
-          // FC-2: 增加 park-revive + turn ack 链 — claim → finalize →
-          // 设置 pendingTurnAck（command_id 来自消息或 Gateway response）
-          // → sendUserMessage(deliverAs=steer) 唤醒 parked agent →
-          // turn_start 事件触发 TURN_TRIGGERED ack。
+          // (e.g. oracle with restricted tools), auto read (finalize deferred
+          // to turn_start) the message and direct-deliver its body as a user turn.
+          // FC-2: 增加 park-revive + turn ack 链 — claim（finalize 由
+          // turn_start 确认 turn 已启动后执行）→ 设置 pendingTurnAck
+          // （command_id 来自消息或 Gateway response）→
+          // sendUserMessage(deliverAs=steer) 唤醒 parked agent →
+          // turn_start 事件触发 TURN_TRIGGERED ack + finalize。
           if (identity?.gateway_socket && !agentHasClaimTool(pi) && msg.kind === "TASK") {
             try {
               const claimClient = new GatewayClient(identity.gateway_socket);
@@ -1086,14 +1108,6 @@ export async function activate(
                 msg_id: msg.msg_id,
               });
               const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? msg.msg_id;
-              if (claimedId) {
-                await claimClient.call("message.finalize", {
-                  session_id: cfg.sessionId,
-                  agent: cfg.agentId,
-                  msg_id: claimedId,
-                  owner: cfg.agentId,
-                });
-              }
               // FC-2: command_id 优先取消息自带字段（Gateway durable command），
               // 兜底取 message.read 返回的 command_id，最后 fallback 到 msg_id。
               const cmdId = msg.command_id
@@ -1113,8 +1127,10 @@ export async function activate(
               // sendUserMessage 对 idle agent 启动 turn，对 streaming agent
               // 排队为 steer——两者都唤醒 ended/parked agent 进入新 turn。
               pi.sendUserMessage(body || msg.subject || msg.kind, { deliverAs: "steer" });
-              seen.add(msg.msg_id);
-              if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+              notifyStats.set(msg.msg_id, stats
+                ? { ...stats, lastAt: now, count: stats.count + 1 }
+                : { firstAt: now, lastAt: now, count: 1 });
+              evictNotifyStats(notifyStats, now);
               scheduleDedupSave(); // P3-19b
               if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)} (park-revive)`);
             } catch (e) {
@@ -1140,7 +1156,7 @@ export async function activate(
               ? { ...stats, lastAt: notifiedAt, count: stats.count + 1 }
               : { firstAt: notifiedAt, lastAt: notifiedAt, count: 1 },
           );
-          if (notifyStats.size > MAX_DEDUP_IDS) notifyStats.delete(notifyStats.keys().next().value!);
+          evictNotifyStats(notifyStats, notifiedAt);
           scheduleDedupSave(); // P3-19b
         } catch (e: unknown) {
           console.error("[mailbox] sendMessage failed, keeping msg for retry:", e);
@@ -1440,6 +1456,9 @@ export default function (pi: ExtensionAPI): void {
     return;
   }
 
+  let idPollFailures = 0;
+  let lastIdWarnAt = 0;
+  const ID_WARN_INTERVAL_MS = 30_000;
   // Runtime adapter: poll for the launcher-written identity (2s), then activate.
   const idInterval = setInterval(() => {
     let identity: GatewayIdentity | null = null;
@@ -1449,7 +1468,14 @@ export default function (pi: ExtensionAPI): void {
       console.error("[mailbox] identity read error:", e);
       return;
     }
-    if (!identity) return;
+    if (!identity) {
+      idPollFailures += 1;
+      if (Date.now() - lastIdWarnAt >= ID_WARN_INTERVAL_MS) {
+        lastIdWarnAt = Date.now();
+        console.warn(`[mailbox] still waiting for a valid identity at ${identityPath} (${idPollFailures} polls) — launcher may have died before writing it`);
+      }
+      return;
+    }
     clearInterval(idInterval);
     const cfg = buildConfig(identity.session_id, identity.agent_id);
     // ctx 未捕获（session_start 未触发）时传空对象——RuntimeEventReporter
