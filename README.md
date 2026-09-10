@@ -54,11 +54,13 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 | Env | Required | 说明 |
 |---|---|---|
 | `OMP_MAILBOX_IDENTITY_FILE` | 是（Worker） | 身份 JSON 路径 `{session_id, worker_id}`——launcher 注入（aimeshchat OMPRunner 写 per-run token 文件） |
-| `OMP_MAILBOX_SESSION_ID` / `OMP_MAILBOX_AGENT_ID` | 是 | 会话/agent 标识（Manager 会话无身份 → 不激活） |
+| `OMP_MAILBOX_SESSION_ID` | 是（Manager watcher） | Manager mailbox session；未设置时依次回退 `SWARM_SESSION_ID`、`OMP_SESSION_ID` |
+| `OMP_MAILBOX_AGENT_ID` | 否（Manager 默认 `manager`） | Manager inbox 的 agent 标识；Worker 由 identity 文件决定 |
 | `MAILBOX_ROOT` | 否 | mailbox root（默认 `~/.local/share/aimeshchat/mailbox`） |
 | `MAILBOX_CLI` | 否 | mailbox CLI（默认 PATH 的 `mailbox`） |
 
-无 `OMP_MAILBOX_IDENTITY_FILE` → Manager 会话，插件不激活（静默 return）。
+Manager 会话不需要 `OMP_MAILBOX_IDENTITY_FILE`。配置 mailbox session id 后，
+插件在 manager inbox 上启用只通知 watcher；没有 session id 时仅保留 manager console。
 
 ## 唤醒机制
 
@@ -66,6 +68,11 @@ omp plugin install github:comicchang/omp-mailbox-plugin
 2. 30s interval fallback + `agent_end` 后立即检查
 3. `mailbox peek --session <id> --agent <id>`（非消费）→ 新消息按 `msg_id` 去重（滚动集合 max 100）
 4. 首次发现 → `sendMessage({ triggerTurn: true })`；未领取消息每 5 分钟最多重推 2 次，消息首次通知起 30 分钟后停止通知；领取后记入 `seen`
+
+Manager mode 只处理 `REPORT`：从 envelope/body 提取 `request_id`、`generation`、
+`reply_to`、`msg_id`，发送 metadata-only notice 并触发下一 turn；watcher 永不
+`mailbox read` 或 `finalize`，通知不是回答完成或 freshness 证明，OMP turn 仍需运行
+`aimeshchat oracle result "$KEY"`。Worker/oracle 的既有 TASK 通知行为不变。
 
 **关键纪律**：插件只通知、永不消费。agent 以 `mailbox read` 的 inbox 为准。
 

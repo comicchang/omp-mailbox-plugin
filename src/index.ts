@@ -43,11 +43,30 @@ export interface GatewayIdentity {
   nonce: string;
 }
 
+interface MailboxMessageSummary {
+  from: string;
+  kind: string;
+  subject: string;
+  msg_id: string;
+  command_id?: string;
+}
+
 interface MailboxSummary {
   pending: number;
-  // FC-2: command_id 来自 Gateway durable command，用于 TURN_TRIGGERED ack。
-  // 消息文件由 Gateway 写入，可能包含 command_id；msg_id 为兜底。
-  messages: { from: string; kind: string; subject: string; msg_id: string; command_id?: string }[];
+  messages: MailboxMessageSummary[];
+}
+
+interface OracleReplyMetadata {
+  requestId: string;
+  generation: string;
+  replyTo: string;
+}
+
+interface MailboxMessageFile {
+  body?: unknown;
+  reply_to?: unknown;
+  request_id?: unknown;
+  generation?: unknown;
 }
 
 export interface Config {
@@ -406,6 +425,50 @@ async function runPeek(cfg: Config): Promise<MailboxSummary | null> {
   if (!out.trim()) return null;
   try { return JSON.parse(out) as MailboxSummary; } catch { return null; }
 }
+
+function readOracleReplyMetadata(cfg: Config, msgId: string): OracleReplyMetadata | null {
+  try {
+    const raw = readFileSync(join(cfg.inboxDir, `${msgId}.json`), "utf-8");
+    const message = JSON.parse(raw) as MailboxMessageFile;
+    let body: Record<string, unknown> = {};
+    if (typeof message.body === "string") {
+      try {
+        const parsed = JSON.parse(message.body) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          body = parsed as Record<string, unknown>;
+        }
+      } catch { /* report body is opaque; metadata is taken from the envelope */ }
+    }
+
+    const requestId = typeof message.request_id === "string"
+      ? message.request_id
+      : typeof body.request_id === "string" ? body.request_id : "";
+    const replyTo = typeof message.reply_to === "string"
+      ? message.reply_to
+      : typeof body.reply_to === "string" ? body.reply_to : "";
+    if (!requestId || !replyTo) return null;
+
+    const generationValue = message.generation
+      ?? body.generation
+      ?? process.env.OMP_MAILBOX_GENERATION;
+    const generation = typeof generationValue === "number" && Number.isFinite(generationValue)
+      ? String(generationValue)
+      : typeof generationValue === "string" && generationValue.trim()
+        ? generationValue
+        : "unknown";
+    const safe = (value: string, maxBytes: number): string =>
+      truncateUtf8(value.replace(/[\u0000-\u001f\u007f]/g, " "), maxBytes);
+    return {
+      requestId: safe(requestId, 160),
+      generation: safe(generation, 80),
+      replyTo: safe(replyTo, 160),
+    };
+  } catch {
+    // The peek result can race the atomic message write; retry on the next poll.
+    return null;
+  }
+}
+
 
 function setupWatcher(inboxDir: string, poll: () => void): AbortController | null {
   const ac = new AbortController();
@@ -1192,21 +1255,141 @@ export async function activate(
   poll();
 }
 
+export function startManagerReplyWatcher(
+  pi: ExtensionAPI,
+  cfg: Config,
+): { poll: () => Promise<void>; stop: () => void } {
+  let watcherAc: AbortController | null = null;
+  let interval: Timer | undefined;
+  let pollPromise: Promise<void> | null = null;
+  let stopped = false;
+  const { seen } = loadDedupState(cfg);
+
+  const poll = async (): Promise<void> => {
+    if (stopped) return;
+    if (pollPromise) {
+      await pollPromise;
+      return;
+    }
+    pollPromise = (async () => {
+      try {
+        const result = await runPeek(cfg);
+        if (!result || !Array.isArray(result.messages)) return;
+        for (const msg of result.messages) {
+          if (stopped || msg.kind.toUpperCase() !== "REPORT" || !msg.msg_id) continue;
+          const metadata = readOracleReplyMetadata(cfg, msg.msg_id);
+          if (!metadata) continue;
+          // msg_id is the immutable message identity; request/generation are
+          // part of the persisted correlation key so a later report cannot
+          // masquerade as an earlier ask.
+          const dedupKey = `${metadata.requestId}\u0000${metadata.generation}\u0000${msg.msg_id}`;
+          if (seen.has(dedupKey)) continue;
+          try {
+            pi.sendMessage(
+              {
+                customType: "omp-mailbox",
+                display: true,
+                content: [
+                  "📬 ORACLE REPLY AVAILABLE",
+                  `Request: ${metadata.requestId}`,
+                  `Generation: ${metadata.generation}`,
+                  `Message: ${msg.msg_id}`,
+                  `Reply to: ${metadata.replyTo}`,
+                  `Subject: ${msg.subject}`,
+                  'Run: aimeshchat oracle result "$KEY" to verify the latest ask.',
+                ].join("\n"),
+                details: {
+                  from: msg.from,
+                  kind: msg.kind,
+                  subject: msg.subject,
+                  request_id: metadata.requestId,
+                  generation: metadata.generation,
+                  msg_id: msg.msg_id,
+                  reply_to: metadata.replyTo,
+                },
+              },
+              { triggerTurn: true, deliverAs: "nextTurn" },
+            );
+            seen.add(dedupKey);
+            if (seen.size > MAX_DEDUP_IDS) seen.delete(seen.values().next().value!);
+            persistDedupState(cfg, seen, new Map());
+          } catch (e: unknown) {
+            console.error("[mailbox] manager reply notification failed, keeping report for retry:", e);
+          }
+        }
+      } catch (e: unknown) {
+        console.error("[mailbox] manager reply watcher error:", e);
+      }
+    })();
+    try {
+      await pollPromise;
+    } finally {
+      pollPromise = null;
+    }
+  };
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(interval);
+    interval = undefined;
+    watcherAc?.abort();
+    watcherAc = null;
+    persistDedupState(cfg, seen, new Map());
+  };
+
+  const ensurePolling = (): void => {
+    if (!watcherAc) {
+      watcherAc = setupWatcher(cfg.inboxDir, () => { void poll(); });
+    }
+    if (!interval) {
+      interval = setInterval(() => {
+        void poll();
+        if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, () => { void poll(); });
+      }, POLL_MS);
+    }
+  };
+  ensurePolling();
+  void poll();
+
+  return { poll, stop };
+}
+
 // ── Manager console mode ──────────────────────────────────────────────
 
 async function activateManagerConsole(pi: ExtensionAPI): Promise<void> {
-  const gatewaySocket = process.env.AIMESHCHAT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/aimeshchat/gateway/control.sock`;
-  if (!existsSync(gatewaySocket)) {
-    console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
-    return;
+  const managerSessionId = [
+    process.env.OMP_MAILBOX_SESSION_ID,
+    process.env.SWARM_SESSION_ID,
+    process.env.OMP_SESSION_ID,
+  ].map((value) => value?.trim() ?? "").find(Boolean) ?? "";
+  const managerAgentId = process.env.OMP_MAILBOX_AGENT_ID?.trim() || "manager";
+  const replyWatcher = managerSessionId
+    ? startManagerReplyWatcher(pi, buildConfig(managerSessionId, managerAgentId))
+    : undefined;
+  if (managerSessionId) {
+    console.warn(`[mailbox] manager reply watcher active (session=${managerSessionId} agent=${managerAgentId})`);
+  } else {
+    console.warn("[mailbox] manager reply watcher disabled: no mailbox session id configured");
   }
-  const client = new GatewayClient(gatewaySocket);
+
   let capturedCtx: ExtensionContext | undefined;
   try {
     pi.on("session_start", (_evt: unknown, ctx: ExtensionContext) => {
       capturedCtx = ctx;
     });
   } catch { /* hook unavailable */ }
+  try {
+    pi.on("session_shutdown", () => {
+      replyWatcher?.stop();
+    });
+  } catch { /* hook unavailable */ }
+
+  const gatewaySocket = process.env.AIMESHCHAT_GATEWAY_SOCKET ?? process.env.OMP_GATEWAY_SOCKET ?? `${homedir()}/.local/share/aimeshchat/gateway/control.sock`;
+  if (!existsSync(gatewaySocket)) {
+    console.warn(`[mailbox] manager console: gateway socket not found at ${gatewaySocket} — gateway may not be running`);
+    return;
+  }
+  const client = new GatewayClient(gatewaySocket);
   const render = () => {
     if (!capturedCtx || capturedCtx.hasUI === false) return;
     try {
@@ -1220,7 +1403,6 @@ async function activateManagerConsole(pi: ExtensionAPI): Promise<void> {
   } catch (e) {
     console.warn(`[mailbox] manager console: gateway unreachable: ${(e as Error).message}`);
   }
-  pi.on("session_shutdown", () => { /* manager console has no claims to release */ });
 }
 
 // ── Entry ─────────────────────────────────────────────────────────────

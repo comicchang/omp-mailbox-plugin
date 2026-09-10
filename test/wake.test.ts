@@ -1,9 +1,10 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   activate,
+  startManagerReplyWatcher,
   MAX_NOTIFY_COUNT,
   MESSAGE_TTL_MS,
   RETRY_NOTIFY_MS,
@@ -181,5 +182,88 @@ describeOrSkip("omp-mailbox-plugin wake-up", () => {
     writeFileSync(p, JSON.stringify({ ...msg, body: "changed" }));
     await Bun.sleep(200); // allow a (suppressed) second event to attempt
     expect(api.messages.length).toBe(1);
+  });
+});
+
+describeOrSkip("manager Oracle reply watcher", () => {
+  const ROOT = join(tmpdir(), `omp-mailbox-manager-${Date.now()}`);
+  const mailboxRoot = join(ROOT, "mailbox");
+  const inbox = join(mailboxRoot, "sess1", "manager", "inbox");
+  let stopWatcher: (() => void) | undefined;
+
+  beforeEach(() => {
+    mkdirSync(inbox, { recursive: true });
+  });
+
+  afterEach(() => {
+    stopWatcher?.();
+    stopWatcher = undefined;
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("REPORT wakes OMP once with correlation metadata and persists dedup", async () => {
+    const api = mockApi();
+    const watcher = startManagerReplyWatcher(
+      api.pi as unknown as ExtensionAPI,
+      cfg(mailboxRoot, "sess1", "manager"),
+    );
+    stopWatcher = watcher.stop;
+    const reportPath = join(inbox, "oracle-report-1.json");
+    writeFileSync(reportPath, JSON.stringify({
+      session_id: "sess1",
+      from: "oracle",
+      to: "manager",
+      subject: "oracle result",
+      body: JSON.stringify({ generation: 7, answer: "opaque" }),
+      kind: "REPORT",
+      msg_id: "oracle-report-1",
+      reply_to: "ask-msg-1",
+      run_id: "run-1",
+      request_id: "req-1",
+      created_at: "2026-09-10T00:00:00Z",
+    }));
+
+    await watcher.poll();
+    expect(api.messages[0].opts.triggerTurn).toBe(true);
+    expect(api.messages[0].msg.content).toContain("Request: req-1");
+    expect(api.messages[0].msg.content).toContain("Generation: 7");
+    expect(api.messages[0].msg.content).toContain("Message: oracle-report-1");
+    expect(api.messages[0].msg.content).toContain("Reply to: ask-msg-1");
+    expect(existsSync(reportPath)).toBe(true);
+
+    watcher.stop();
+    const restarted = mockApi();
+    const restartedWatcher = startManagerReplyWatcher(
+      restarted.pi as unknown as ExtensionAPI,
+      cfg(mailboxRoot, "sess1", "manager"),
+    );
+    stopWatcher = restartedWatcher.stop;
+    await restartedWatcher.poll();
+    expect(restarted.messages).toHaveLength(0);
+  });
+
+  test("non-REPORT messages do not wake the manager", async () => {
+    const api = mockApi();
+    const watcher = startManagerReplyWatcher(
+      api.pi as unknown as ExtensionAPI,
+      cfg(mailboxRoot, "sess1", "manager"),
+    );
+    stopWatcher = watcher.stop;
+    writeFileSync(join(inbox, "task-1.json"), JSON.stringify({
+      session_id: "sess1",
+      from: "worker",
+      to: "manager",
+      subject: "new task",
+      body: "not a reply",
+      kind: "TASK",
+      msg_id: "task-1",
+      request_id: "req-task",
+      run_id: "run-task",
+      created_at: "2026-09-10T00:00:00Z",
+    }));
+
+    await watcher.poll();
+    expect(api.messages).toHaveLength(0);
+    expect(existsSync(join(inbox, "task-1.json"))).toBe(true);
   });
 });
