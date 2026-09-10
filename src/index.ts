@@ -30,6 +30,12 @@ let capturedBackendSessionId = "";
 // P3-19d: sweep stale launcher identity files every 10 min (one-shot sweep
 // also runs at activation) so ~/.omp/mailbox-identity stops accumulating.
 const IDENTITY_CLEANUP_MS = 10 * 60_000;
+// Claim-2: auto-claimed messages stay in the store's processing area until a
+// turn_start confirms the turn actually started. If no turn starts within
+// this TTL (steer lost / agent died mid-dispatch), poll() releases the
+// message back to the inbox instead of holding the claim silently.
+// OMP_MAILBOX_PENDING_ACK_TTL_MS is a test seam only (default 120s).
+const PENDING_ACK_TTL_MS = Number(process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS ?? 120_000);
 
 /** Launcher identity (0600 file created by aimeshchat, read-only here). */
 export interface GatewayIdentity {
@@ -313,7 +319,13 @@ function cleanupIdentityDir(identityDir: string, ownPath: string): void {
         // the user manages its lifecycle manually.
         continue;
       }
-      try { process.kill(pid, 0); } catch { stale = true; }
+      try {
+        process.kill(pid, 0);
+      } catch (e) {
+        // Claim-2: EPERM = 进程存在但属于其它用户（Windows / 多用户）；
+        // 只有 ESRCH 才是 owner 已死 — 与 readIdentityFile 的 EPERM 语义一致。
+        if ((e as NodeJS.ErrnoException)?.code !== "EPERM") stale = true;
+      }
     } catch { stale = true; } // corrupt/unreadable → stale
     if (stale) {
       try { unlinkSync(p); } catch { /* raced with another sweep — ignore */ }
@@ -743,16 +755,24 @@ export async function activate(
   // runtime.command_ack 的 request_id 回传，命中命令表主键推进状态机。
   // 禁止把 sendUserMessage 未抛异常当成功——只有 Gateway 持久化 ack
   // 后才算 TURN_TRIGGERED。
-  // read/claim 在投递前，finalize 只在 turn_start 确认 turn 已启动后执行。
+  // read/claim（message.read: inbox→processing）在投递前，finalize 只在
+  // turn_start 确认 turn 已启动后执行；投递失败与 TTL 兜底走 message.release
+  // （processing→inbox）重投 —— 消息绝不无声滞留在 processing。
+  // Claim-2: pending ack 按 msg_id 建条目 —— 一个 poll 可能 claim 多条
+  // TASK，单槽（旧 "next" 键）会互相覆盖导致 ack/finalize 丢失。
+  // 已知局限：OMP turn_start 不携带 turn 身份，drain 时无法精确区分
+  // 是哪条 steer 触发的 turn；用户手动触发的 turn 与我们的 steer 竞争
+  // 时会提前消费 ack 条目 —— 可接受：消息本就为投递而 claim，且 store
+  // 层 finalize 幂等。turn_start 时逐条 finalize + TURN_TRIGGERED ack，
+  // 每条各自 catch、互不阻塞、至多消费一次。
   interface PendingTurnAck {
     commandId: string;
     msgId: string;
     generation: number;
+    /** claim（message.read）完成时刻，供 poll() 的 TTL 兜底释放使用。 */
+    claimedAt: number;
   }
-  // key = msg_id；同一时刻最多一个 pending ack（单消息投递）
   const pendingTurnAck = new Map<string, PendingTurnAck>();
-
-  // ── Gateway handshake (best-effort) ────────────────────────────────
   let reporter: RuntimeEventReporter | null = null;
   let initialTask = "";
     if (identity) {
@@ -796,20 +816,26 @@ export async function activate(
         // First TASK → pi.sendUserMessage (real user turn, not a notification).
         const initialTaskMsgId = (handshakeResult?.initial_task_msg_id as string) ?? "";
         if (initialTask) {
+            let ackKey = "";
             try {
                 // FC-2: 初始任务也走 turn ack 链 — command_id 从 handshake 响应获取。
                 const initialCmdId = (handshakeResult?.initial_task_command_id as string) ?? initialTaskMsgId;
                 if (initialCmdId) {
-                    pendingTurnAck.set("next", {
+                    // Claim-2: 按 msg_id 建条目；无 msg_id 时用 command_id 兜底键
+                    //（该条目 msgId 为空，turn_start 不会对它 finalize/release）。
+                    ackKey = initialTaskMsgId || `initial:${initialCmdId}`;
+                    pendingTurnAck.set(ackKey, {
                         commandId: initialCmdId,
                         msgId: initialTaskMsgId,
                         generation: identity.generation,
+                        claimedAt: Date.now(),
                     });
                 }
                 pi.sendUserMessage(initialTask, { deliverAs: "steer" });
                 reporter.updateUi("initial task dispatched (park-revive)");
             } catch (e) {
-                pendingTurnAck.delete("next"); // FC-2: 清理失败 ack
+                // FC-2: 清理失败 ack（键与 set 一致）
+                if (ackKey) pendingTurnAck.delete(ackKey);
                 console.error(`[mailbox] initial task dispatch failed: ${(e as Error).message}`);
             }
         }
@@ -909,27 +935,33 @@ export async function activate(
     // ack.commandId 作为 request_id 上报 TURN_TRIGGERED，直接推进命令
     // 状态机（跳级自动补齐 QUEUED→CLAIMED→REVIVING→TRIGGERING）。
     // 只在有 pending ack 时回报（正常 user turn 不触发 ack）。
-    const ack = pendingTurnAck.get("next");
-    if (ack && identity?.gateway_socket) {
-      pendingTurnAck.delete("next");
-      const turnAckClient = new GatewayClient(identity.gateway_socket);
-      turnAckClient.call("runtime.command_ack", {
-        request_id: ack.commandId, // = mailbox command_id = Gateway 命令表主键
-        state: "TURN_TRIGGERED",
-        runtime_id: identity.runtime_id,
-        generation: identity.generation,
-        turn_id: "", // OMP turn_start 不暴露 turn_id；Gateway 通过时间窗口关联
-      }).catch((e) => {
-        console.error(`[mailbox] TURN_TRIGGERED ack failed: ${(e as Error).message}`);
-      });
-      if (ack.msgId) {
-        new GatewayClient(identity.gateway_socket).call("message.finalize", {
-          session_id: identity.session_id,
-          agent: identity.agent_id,
-          msg_id: ack.msgId,
-          owner: identity.agent_id,
-        }).catch((e) => console.warn(
-          `[mailbox] finalize after turn_start failed: ${(e as Error).message}`));
+    // Claim-2: 逐条 drain pending ack（Map 按 msg_id 建键，一个 poll 可能
+    // claim 多条 TASK）。OMP turn_start 不携带 turn 身份，无法精确对应
+    // 是哪条 steer 触发的 turn（已知局限见上方 Claim-2 注释：用户手动
+    // 触发的 turn 可能提前消费 ack 条目，可接受）。每条至多消费一次：
+    // 先删条目再异步回报，command_ack 与 finalize 各自 catch、互不阻塞。
+    if (identity?.gateway_socket) {
+      for (const [ackKey, ack] of pendingTurnAck) {
+        pendingTurnAck.delete(ackKey);
+        const turnAckClient = new GatewayClient(identity.gateway_socket);
+        turnAckClient.call("runtime.command_ack", {
+          request_id: ack.commandId, // = mailbox command_id = Gateway 命令表主键
+          state: "TURN_TRIGGERED",
+          runtime_id: identity.runtime_id,
+          generation: identity.generation,
+          turn_id: "", // OMP turn_start 不暴露 turn_id；Gateway 通过时间窗口关联
+        }).catch((e) => {
+          console.error(`[mailbox] TURN_TRIGGERED ack failed: ${(e as Error).message}`);
+        });
+        if (ack.msgId) {
+          new GatewayClient(identity.gateway_socket).call("message.finalize", {
+            session_id: identity.session_id,
+            agent: identity.agent_id,
+            msg_id: ack.msgId,
+            owner: identity.agent_id,
+          }).catch((e) => console.warn(
+            `[mailbox] finalize after turn_start failed: ${(e as Error).message}`));
+        }
       }
     }
     if (reporter) {
@@ -1047,6 +1079,26 @@ export async function activate(
     if (polling) return;
     polling = true;
     try {
+      // Claim-2: TTL 兜底 —— auto-claim 后若 turn 一直未被 turn_start 确认
+      // （steer 丢失 / agent 死在投递途中 / ack 条目被用户 turn 提前消费），
+      // 条目会永远滞留。超过 TTL 的未消费条目 message.release 回 inbox
+      // （processing→inbox）重新投递 —— 没有 turn 确认时，选择重投而非
+      // 静默持有 claim。条目删除故每条只 warn 一次；重投受 notifyStats
+      // 预算约束（A11.3 有界重推）。
+      for (const [ackKey, ack] of pendingTurnAck) {
+        if (Date.now() - ack.claimedAt <= PENDING_ACK_TTL_MS) continue;
+        pendingTurnAck.delete(ackKey);
+        if (ack.msgId && identity?.gateway_socket) {
+          new GatewayClient(identity.gateway_socket).call("message.release", {
+            session_id: identity.session_id,
+            agent: identity.agent_id,
+            msg_id: ack.msgId,
+            owner: identity.agent_id,
+          }).catch((e) => console.warn(
+            `[mailbox] TTL release(${ack.msgId}) failed: ${(e as Error).message}`));
+        }
+        console.warn(`[mailbox] pending ack ${ackKey} expired without turn_start — released back to inbox`);
+      }
       const result = await runPeek(cfg);
       if (!result) return; // peek 失败：保留上一次 widget 状态，不伪装成空 inbox
       if (reporter) reporter.setPending(result.pending);
@@ -1056,6 +1108,11 @@ export async function activate(
       // Runs before the empty-check so bookkeeping keeps up even when the
       // inbox just drained to zero.
       for (const [msgId] of notifyStats) {
+        // Claim-2: pendingTurnAck 中的消息已被本进程 claim（inbox→processing），
+        // 从 peek 消失属预期而非已消费 —— 绝不 seen.add（否则 TTL 兜底释放回
+        // inbox 后会被去重永久吞掉，消息丢失）。其归宿由 turn_start 的
+        // finalize 或 poll() 的 TTL 兜底 release 负责。
+        if (pendingTurnAck.has(msgId)) continue;
         if (!result.messages.some((m) => m.msg_id === msgId)) {
           seen.add(msgId);
           notifyStats.delete(msgId);
@@ -1088,14 +1145,19 @@ export async function activate(
           const bodyBlock = body ? `\n${body}\n` : "";
 
           // A11.4: claim degradation — when the agent has no claim tool
-          // (e.g. oracle with restricted tools), auto read (finalize deferred
-          // to turn_start) the message and direct-deliver its body as a user turn.
-          // FC-2: 增加 park-revive + turn ack 链 — claim（finalize 由
-          // turn_start 确认 turn 已启动后执行）→ 设置 pendingTurnAck
-          // （command_id 来自消息或 Gateway response）→
+          // (e.g. oracle with restricted tools), auto read the message
+          // (message.read: inbox→processing) and direct-deliver its body as
+          // a user turn.
+          // FC-2: 增加 park-revive + turn ack 链 — claim（message.read 把消息
+          // 移入 processing，finalize 由 turn_start 确认 turn 已启动后执行）→
+          // 设置 pendingTurnAck（command_id 来自消息或 Gateway response）→
           // sendUserMessage(deliverAs=steer) 唤醒 parked agent →
           // turn_start 事件触发 TURN_TRIGGERED ack + finalize。
+          // 失败/兜底路径：sendUserMessage 抛出 → message.release 回 inbox +
+          // 删除 ack 条目（notifyStats 预算约束下有界重推）；steer 已发出但
+          // turn 一直未确认 → poll() 按 PENDING_ACK_TTL_MS 兜底 release 重投。
           if (identity?.gateway_socket && !agentHasClaimTool(pi) && msg.kind === "TASK") {
+            let claimed = false; // Claim-2: message.read 成功后消息已 inbox→processing
             try {
               const claimClient = new GatewayClient(identity.gateway_socket);
               // P1-8: pass msg_id to claim the exact notified message,
@@ -1107,21 +1169,26 @@ export async function activate(
                 owner: cfg.agentId,
                 msg_id: msg.msg_id,
               });
+              claimed = true; // Claim-2: 读成功 → 消息已移入 processing
               const claimedId = (read.message as { msg_id?: string } | null)?.msg_id ?? msg.msg_id;
               // FC-2: command_id 优先取消息自带字段（Gateway durable command），
               // 兜底取 message.read 返回的 command_id，最后 fallback 到 msg_id。
               const cmdId = msg.command_id
                 ?? (read.message as { command_id?: string } | null)?.command_id
                 ?? claimedId;
-              // FC-2: 设置 pendingTurnAck — turn_start 事件将用它经
-              // runtime.command_ack 回报 TURN_TRIGGERED 给 Gateway
-              // （request_id = cmdId = mailbox command_id，对齐命令表主键）。
+              // FC-2/Claim-2: 设置 pendingTurnAck（按 msg_id 建键 —— 旧单槽
+              // "next" 会被多条 TASK 互相覆盖导致 ack/finalize 丢失）。
+              // turn_start 事件将用它经 runtime.command_ack 回报
+              // TURN_TRIGGERED 给 Gateway（request_id = cmdId = mailbox
+              // command_id，对齐命令表主键）；claimedAt 供 poll() 的 TTL
+              // 兜底释放使用。
               // 禁止把 sendUserMessage 未抛异常当成功——只有 turn_start
               // 确认 turn 已启动。
-              pendingTurnAck.set("next", {
+              pendingTurnAck.set(msg.msg_id, {
                 commandId: cmdId,
                 msgId: claimedId,
                 generation: identity.generation,
+                claimedAt: now,
               });
               // FC-2: deliverAs="steer" 用于 park-revive 唤醒 parked agent。
               // sendUserMessage 对 idle agent 启动 turn，对 streaming agent
@@ -1134,8 +1201,27 @@ export async function activate(
               scheduleDedupSave(); // P3-19b
               if (reporter) reporter.updateUi(`auto-claimed ${msg.msg_id.slice(0, 8)} (park-revive)`);
             } catch (e) {
-              // FC-2: 投递失败时清理 pendingTurnAck，避免 stale ack
-              pendingTurnAck.delete("next");
+              // Claim-2: 投递失败处理 —— message.read 失败时消息仍在 inbox，
+              // 无需 release；sendUserMessage 抛出时消息已移入 processing，
+              // message.release 回 inbox（processing→inbox）+ 删除 pending
+              // ack 条目。记录 notifyStats（有界重推预算）后下轮 poll 重试。
+              if (claimed) {
+                pendingTurnAck.delete(msg.msg_id);
+                if (identity?.gateway_socket) {
+                  new GatewayClient(identity.gateway_socket).call("message.release", {
+                    session_id: cfg.sessionId,
+                    agent: cfg.agentId,
+                    msg_id: msg.msg_id,
+                    owner: cfg.agentId,
+                  }).catch((re) => console.warn(
+                    `[mailbox] message.release(${msg.msg_id}) failed: ${(re as Error).message}`));
+                }
+                notifyStats.set(msg.msg_id, stats
+                  ? { ...stats, lastAt: now, count: stats.count + 1 }
+                  : { firstAt: now, lastAt: now, count: 1 });
+                evictNotifyStats(notifyStats, now);
+                scheduleDedupSave(); // P3-19b
+              }
               console.error("[mailbox] claim fallback failed, retrying later:", e);
               continue;
             }
