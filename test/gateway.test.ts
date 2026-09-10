@@ -3,16 +3,24 @@ import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, utimesSync 
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import {
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { Config, GatewayIdentity } from "../src/index";
+
+// Claim-2 test seam. Static import cannot work here: src/index captures
+// PENDING_ACK_TTL_MS from OMP_MAILBOX_PENDING_ACK_TTL_MS once at module
+// evaluation, and ESM hoisting evaluates static imports before any module
+// body statement — so the env seam must be set before a deliberately dynamic
+// import (test exercising a module-load boundary). 50ms is safe for the
+// whole suite: no test besides the TTL-fallback one keeps a pending ack
+// alive across a poll().
+process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS = "50";
+const {
   activate,
   GatewayClient,
   readIdentityFile,
   RuntimeEventReporter,
-  type Config,
-  type GatewayIdentity,
-} from "../src/index";
-import pluginFactory from "../src/index";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+  default: pluginFactory,
+} = await import("../src/index");
 
 /** Kind of a gateway event record (validated narrowing, no unchecked cast). */
 function eventKind(e: Record<string, unknown>): string {
@@ -26,6 +34,8 @@ class FakeGateway {
   requests: { method: string; params: Record<string, unknown> }[] = [];
   events: Record<string, unknown>[] = [];
   released: string[] = [];
+  finalized: string[] = [];
+  releasedMsgs: string[] = [];
   socketPath: string;
   private _idCounter = 0;
 
@@ -37,7 +47,10 @@ class FakeGateway {
         buf += chunk.toString("utf-8");
         if (!buf.includes("\n")) return;
         const line = buf.split("\n", 1)[0];
-        buf = "";
+        // NDJSON framing: keep whatever follows the newline (a chunk may
+        // hold a full line plus the start of the next) instead of dropping
+        // the leftover by resetting the buffer to "".
+        buf = buf.slice(buf.indexOf("\n") + 1);
         let req: { id: string; method: string; params: Record<string, unknown> };
         try {
           req = JSON.parse(line);
@@ -68,6 +81,12 @@ class FakeGateway {
         return { ok: true, result: { pending: 0, messages: [] } };
       case "message.read":
         return { ok: true, result: { status: "ok", message: null, receipt: { status: "delivered", msg_id: "rcpt-1" } } };
+      case "message.finalize":
+        this.finalized.push(String(req.params.msg_id ?? ""));
+        return { ok: true, result: { status: "ok" } };
+      case "message.release":
+        this.releasedMsgs.push(String(req.params.msg_id ?? ""));
+        return { ok: true, result: { status: "released" } };
       case "park.release":
         this.released.push(String(req.params.review_key ?? ""));
         return { ok: true, result: { released: req.params.review_key } };
@@ -105,16 +124,26 @@ function mockCtx(opts: { hasUI?: boolean; idle?: boolean } = {}): ExtensionConte
   } as unknown as ExtensionContext;
 }
 
-function mockPi(messages: SentMessage[]): ExtensionAPI {
+/** tools default to a claim-less set (no bash, no mailbox/inbox/claim) so
+ *  TASK delivery takes the Claim-2 auto-claim path; pass claim-capable tool
+ *  names (e.g. ["bash", "mailbox"]) to exercise the notify-only path. */
+function mockPi(messages: SentMessage[], tools: string[] = ["read", "write"]): ExtensionAPI {
   return {
     sendMessage: (msg: unknown, o: unknown) => {
       const content = (msg as { content: string }).content;
       const opts = (o ?? {}) as { triggerTurn: boolean; deliverAs?: string };
       messages.push({ content, opts });
     },
-    sendUserMessage: (content: string) => {
-      messages.push({ content: String(content), opts: { triggerTurn: true, deliverAs: "nextTurn" } });
+    sendUserMessage: (content: string, o: unknown) => {
+      // Record what the plugin actually passed (auto-claim delivers with
+      // { deliverAs: "steer" }) instead of fabricating triggerTurn.
+      const opts = (o ?? {}) as { triggerTurn?: boolean; deliverAs?: string };
+      messages.push({
+        content: String(content),
+        opts: { triggerTurn: opts.triggerTurn ?? false, deliverAs: opts.deliverAs },
+      });
     },
+    getActiveTools: () => tools,
     on: () => {},
   } as unknown as ExtensionAPI;
 }
@@ -307,7 +336,11 @@ describe("plugin runtime adapter", () => {
       session_id: "s1", agent_id: "w1", runtime_id: "rt-1",
       generation: 2, gateway_socket: sock, nonce: "n1",
     });
-    await activate(mockPi(messages) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    // claim-capable agent → notify-only path. Every runtime in this describe
+    // must stay claim-capable: a leaked poll loop (parked-oracle design, no
+    // teardown) from a claim-less runtime would auto-claim later tests'
+    // messages behind their backs.
+    await activate(mockPi(messages, ["bash", "mailbox"]) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
     await until(() => fake.requests.some((r) => r.method === "runtime.register"));
     const reg = fake.requests.find((r) => r.method === "runtime.register")!;
     expect(reg.params.session_id).toBe("s1");
@@ -321,7 +354,9 @@ describe("plugin runtime adapter", () => {
     writeIdentity(identityPath, {
       session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
     });
-    await activate(mockPi(messages) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    // claim-capable agent (bash/CLI) → notify-only path; mockPi's default
+    // claim-less tools would take the Claim-2 auto-claim path instead.
+    await activate(mockPi(messages, ["bash", "mailbox"]) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
 
     const msg = {
       session_id: "s1", from: "manager", to: "w1", subject: "task",
@@ -342,7 +377,9 @@ describe("plugin runtime adapter", () => {
       session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
     });
     // idle context
-    await activate(mockPi(messages) as ExtensionAPI, mockCtx({ idle: true }), cfg(ROOT, "s1", "w1"), identityPath);
+    // claim-capable agent → notify path (deliverAs from ctx.isIdle); the
+    // auto-claim path always steers regardless of idle state.
+    await activate(mockPi(messages, ["bash", "mailbox"]) as ExtensionAPI, mockCtx({ idle: true }), cfg(ROOT, "s1", "w1"), identityPath);
     const msg = {
       session_id: "s1", from: "manager", to: "w1", subject: "t", body: "b",
       kind: "TASK", msg_id: "mgr_2", created_at: "2026-01-01T00:00:00Z",
@@ -493,10 +530,162 @@ describe("plugin runtime adapter", () => {
     writeFileSync(stalePath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: 99999999 }));
     writeFileSync(livePath, JSON.stringify({ session_id: "s1", agent_id: "w1", owner_pid: process.pid }));
 
-    await activate(mockPi(messages) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), ownPath);
+    await activate(mockPi(messages, ["bash", "mailbox"]) as ExtensionAPI, mockCtx(), cfg(ROOT, "s1", "w1"), ownPath);
     await until(() => !existsSync(stalePath));
     expect(existsSync(ownPath)).toBe(true);
     expect(existsSync(livePath)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+describe("claim-2 turn ack lifecycle (auto-claim / finalize / TTL release)", () => {
+  // Per-test tmpdir: each test gets its own socket/inbox/dedup paths so a
+  // leaked poll loop from a previous test (activate() never tears down its
+  // watcher/interval — parked-oracle design) cannot watch this test's inbox
+  // or auto-claim its fixture behind its back.
+  let seq = 0;
+  let ROOT = "";
+  let sock = "";
+  let mailboxRoot = "";
+  let identityPath = "";
+  const MSG_ID = "mgr_claim_1";
+  const CMD_ID = "cmd_claim_1";
+  let fake: FakeGateway;
+  let messages: SentMessage[];
+  let handlers: Map<string, () => void>;
+  let inbox: string;
+  let savedPollMs: string | undefined;
+  let savedTtl: string | undefined;
+
+  beforeEach(async () => {
+    ROOT = join(tmpdir(), `gw-claim2-${Date.now()}-${++seq}`);
+    sock = join(ROOT, "gw.sock");
+    mailboxRoot = join(ROOT, "mailbox");
+    identityPath = join(ROOT, "identity.json");
+    // Seams: PENDING_ACK_TTL_MS captured at src import (top-of-file, 50ms);
+    // POLL_MS is read per-activate, so setting it here drives ONLY this
+    // describe's activate instances. Save/restore both.
+    savedPollMs = process.env.OMP_MAILBOX_POLL_MS;
+    savedTtl = process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS;
+    process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS = "50";
+    process.env.OMP_MAILBOX_POLL_MS = "120";
+    mkdirSync(join(mailboxRoot, "s1", "w1", "inbox"), { recursive: true });
+    mkdirSync(join(mailboxRoot, "s1", "w1", "processing"), { recursive: true });
+    fake = new FakeGateway(sock);
+    await fake.listen();
+    messages = [];
+    handlers = new Map();
+    inbox = join(mailboxRoot, "s1", "w1", "inbox");
+  });
+
+  afterEach(async () => {
+    await fake.close();
+    rmSync(ROOT, { recursive: true, force: true });
+    if (savedTtl === undefined) delete process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS;
+    else process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS = savedTtl;
+    if (savedPollMs === undefined) delete process.env.OMP_MAILBOX_POLL_MS;
+    else process.env.OMP_MAILBOX_POLL_MS = savedPollMs;
+  });
+
+  /** pi mock with claim-less tools (no bash, no mailbox/inbox/claim →
+   *  agentHasClaimTool false → auto-claim path), captured lifecycle handlers,
+   *  and optional sendUserMessage failure. */
+  function claimPi(opts: { failSend?: boolean } = {}): ExtensionAPI {
+    const recordOpts = (o: unknown): { triggerTurn: boolean; deliverAs?: string } => {
+      if (typeof o !== "object" || o === null) return { triggerTurn: false };
+      const deliverAs = "deliverAs" in o && typeof o.deliverAs === "string" ? o.deliverAs : undefined;
+      const triggerTurn = "triggerTurn" in o && typeof o.triggerTurn === "boolean" ? o.triggerTurn : false;
+      return { triggerTurn, deliverAs };
+    };
+    return {
+      sendMessage: (msg: unknown, o: unknown) => {
+        const content = typeof msg === "object" && msg !== null && "content" in msg
+          ? String(msg.content)
+          : "";
+        messages.push({ content, opts: recordOpts(o) });
+      },
+      sendUserMessage: (content: string, o: unknown) => {
+        if (opts.failSend) throw new Error("sendUserMessage failed (test)");
+        messages.push({ content: String(content), opts: recordOpts(o) });
+      },
+      getActiveTools: () => ["read", "write"],
+      on: (evt: string, fn: () => void) => handlers.set(evt, fn),
+    } as unknown as ExtensionAPI;
+  }
+
+  function writeTask(): void {
+    writeFileSync(join(inbox, `${MSG_ID}.json`), JSON.stringify({
+      session_id: "s1", from: "manager", to: "w1", subject: "claim me",
+      body: "claim-body", kind: "TASK", msg_id: MSG_ID, command_id: CMD_ID,
+      created_at: "2026-01-01T00:00:00Z",
+    }));
+  }
+
+  test("auto-claim: turn_start finalizes once and acks TURN_TRIGGERED", async () => {
+    writeIdentity(identityPath, {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
+    });
+    // Write before activate so the activation poll() claims deterministically
+    // (no watcher race on a file written after activation).
+    writeTask();
+    await activate(claimPi(), mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+
+    // Claimed the exact fixture message (message.read: inbox→processing) and
+    // delivered its body as a steer — the pendingTurnAck path, not notify.
+    await until(() => fake.requests.some((r) => r.method === "message.read"));
+    await until(() => messages.length > 0);
+    const read = fake.requests.find((r) => r.method === "message.read")!;
+    expect(read.params.msg_id).toBe(MSG_ID);
+    expect(messages[0]?.opts.deliverAs).toBe("steer");
+    expect(messages[0]?.content).toBe("claim-body");
+    expect(fake.finalized.length).toBe(0); // finalize deferred until turn_start
+
+    // turn_start confirms the turn actually started → drain the pending ack:
+    // exactly one TURN_TRIGGERED command ack + one finalize, fixture msg_id.
+    handlers.get("turn_start")?.();
+    await until(() => fake.finalized.length > 0
+      && fake.requests.some((r) => r.method === "runtime.command_ack"));
+    expect(fake.finalized).toEqual([MSG_ID]);
+    const acks = fake.requests.filter((r) => r.method === "runtime.command_ack");
+    expect(acks.length).toBe(1);
+    expect(acks[0]?.params.state).toBe("TURN_TRIGGERED");
+    expect(acks[0]?.params.request_id).toBe(CMD_ID); // command_id = command table PK
+  });
+
+  test("TTL fallback: pending ack released back to inbox when turn never starts", async () => {
+    writeIdentity(identityPath, {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
+    });
+    writeTask();
+    await activate(claimPi(), mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+    await until(() => messages.length > 0); // claimed + steered, no turn_start
+    expect(fake.finalized.length).toBe(0);
+
+    // Age the pending ack past PENDING_ACK_TTL_MS (50ms seam), then trigger
+    // one poll() via an inbox write (watcher → poll).
+    // Age the pending ack past PENDING_ACK_TTL_MS (50ms seam), then let the
+    // poll interval (OMP_MAILBOX_POLL_MS seam, 120ms in this describe) drive
+    // poll() — fs.watch delivery is unreliable with ~25 leaked watchers from
+    // earlier activate() calls in the same process (parked-oracle design
+    // never tears them down), so tests must not depend on it.
+    await until(() => fake.releasedMsgs.includes(MSG_ID), 3000);
+    expect(fake.finalized.length).toBe(0); // released, never finalized
+    expect(fake.finalized.length).toBe(0); // released, never finalized
+  });
+
+  test("sendUserMessage throw: claim released via message.release, no finalize", async () => {
+    writeIdentity(identityPath, {
+      session_id: "s1", agent_id: "w1", runtime_id: "rt-1", gateway_socket: sock,
+    });
+    writeTask();
+    await activate(claimPi({ failSend: true }), mockCtx(), cfg(ROOT, "s1", "w1"), identityPath);
+
+    // message.read succeeded (inbox→processing) but delivery threw → the
+    // message must be released back to the inbox, never silently finalized.
+    await until(() => fake.releasedMsgs.includes(MSG_ID));
+    expect(fake.requests.some((r) => r.method === "message.read")).toBe(true);
+    expect(messages.length).toBe(0); // nothing was delivered
+    expect(fake.finalized.length).toBe(0);
   });
 });
 

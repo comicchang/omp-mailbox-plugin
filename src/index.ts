@@ -1085,8 +1085,11 @@ export async function activate(
       // （processing→inbox）重新投递 —— 没有 turn 确认时，选择重投而非
       // 静默持有 claim。条目删除故每条只 warn 一次；重投受 notifyStats
       // 预算约束（A11.3 有界重推）。
+      // 使用点读 env 而非模块加载时固化——测试进程里其它测试文件的静态
+      // import 可能先于本文件的环境注入求值 src 单例，固化常量会失真。
+      const ttlMs = Number(process.env.OMP_MAILBOX_PENDING_ACK_TTL_MS ?? PENDING_ACK_TTL_MS);
       for (const [ackKey, ack] of pendingTurnAck) {
-        if (Date.now() - ack.claimedAt <= PENDING_ACK_TTL_MS) continue;
+        if (Date.now() - ack.claimedAt <= ttlMs) continue;
         pendingTurnAck.delete(ackKey);
         if (ack.msgId && identity?.gateway_socket) {
           new GatewayClient(identity.gateway_socket).call("message.release", {
@@ -1261,10 +1264,14 @@ export async function activate(
   function ensureInboxPolling(): void {
     if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll);
     if (!inboxInterval) {
+      // OMP_MAILBOX_POLL_MS 仅为测试 seam（默认 30s 不变）——在 activate 时
+      // 读取而非模块加载时，使单个测试可用小轮询间隔驱动 poll，而不影响
+      // 同进程其它 activate 实例。
+      const pollMs = Number(process.env.OMP_MAILBOX_POLL_MS ?? POLL_MS);
       inboxInterval = setInterval(() => {
         poll();
         if (!watcherAc) watcherAc = setupWatcher(cfg.inboxDir, poll);
-      }, POLL_MS);
+      }, pollMs);
     }
   }
   ensureInboxPolling();
